@@ -8,3 +8,7 @@ target_link_libraries(
   mpsc-queue
   benchmark::benchmark
 )
+target_include_directories(
+  queue_bench PUBLIC
+  ${CMAKE_SOURCE_DIR}/include
+)

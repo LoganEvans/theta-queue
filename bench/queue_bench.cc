@@ -1,8 +1,11 @@
+#include <atomic_queue/atomic_queue.h>
 #include <benchmark/benchmark.h>
 
 #include <atomic>
 #include <barrier>
+#include <concepts>
 #include <memory>
+#include <optional>
 #include <semaphore>
 
 #include "mpmc_queue.h"
@@ -10,11 +13,56 @@
 
 namespace theta {
 
-template <typename QType, bool kUseTry>
+template <typename Q>
+concept QueueType = std::default_initializable<Q> && requires(Q q, int* v) {
+  { q.try_pop() } -> std::same_as<std::optional<int*>>;
+  { q.try_push(v) } -> std::same_as<bool>;
+  q.push(v);
+  { q.pop() } -> std::same_as<int*>;
+};
+
+struct MPMCQueueAdaptor {
+  std::optional<int*> try_pop() { return queue.try_pop(); }
+
+  bool try_push(int* v) { return queue.try_push(v); }
+
+  void push(int* v) { return queue.push(v); }
+
+  int* pop() { return queue.pop(); }
+
+  MPMCQueue<int*> queue{QueueOpts{}.set_max_size(1024)};
+};
+
+struct MoodycamelAdaptor {
+  std::optional<int*> try_pop() {
+    int* v;
+    if (queue.try_pop(v)) {
+      return v;
+    }
+    return {};
+  }
+
+  bool try_push(int* v) { return queue.try_push(v); }
+
+  void push(int* v) { return queue.push(v); }
+
+  int* pop() { return queue.pop(); }
+
+  atomic_queue::AtomicQueue</*T=*/int*,
+                            /*SIZE=*/1024,
+                            /*NIL=*/nullptr,
+                            /*MINIMIZE_CONTENTION=*/true,
+                            /*MAXIMIZE_THROUGHPUT=*/true,
+                            /*TOTAL_ORDER=*/true,
+                            /*SPSC=*/false>
+      queue;
+};
+
+template <QueueType QType, bool kUseTry>
 static void producer_consumer(benchmark::State& state,
                               int num_producers,
                               int num_consumers) {
-  QType queue{QueueOpts{}.set_max_size(1024)};
+  QType queue{};
 
   std::atomic<bool> done{false};
   int end_sentinel;
@@ -93,55 +141,54 @@ template <typename QType>
 static void BM_multi_producer_single_consumer(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/false>(state, state.range(0), 1);
 }
-// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MPSCQueue<int*>)
-//     ->Args({1})
-//     ->Args({2})
-//     ->Args({4})
-//     ->Args({8})
-//     ->Args({12})
-//     ->Args({24});
-BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MPMCQueue<int*>)
-    ->Args({1})
-    ->Args({2})
-    ->Args({4})
-    ->Args({8})
-    ->Args({12})
-    ->Args({24});
+//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MoodycamelAdaptor)
+//    ->Args({1})
+//    ->Args({2})
+//    ->Args({4})
+//    ->Args({8})
+//    ->Args({12})
+//    ->Args({24});
+//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MPMCQueueAdaptor)
+//    ->Args({1})
+//    ->Args({2})
+//    ->Args({4})
+//    ->Args({8})
+//    ->Args({12})
+//    ->Args({24});
 
 template <typename QType>
 static void BM_multi_producer_single_consumer_try(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/true>(state, state.range(0), 1);
 }
-// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MPSCQueue<int*>)
-//     ->Args({1})
-//     ->Args({2})
-//     ->Args({4})
-//     ->Args({8})
-//     ->Args({12})
-//     ->Args({24});
-BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MPMCQueue<int*>)
-    ->Args({1})
-    ->Args({2})
-    ->Args({4})
-    ->Args({8})
-    ->Args({12})
-    ->Args({24});
+//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MoodycamelAdaptor)
+//    ->Args({1})
+//    ->Args({2})
+//    ->Args({4})
+//    ->Args({8})
+//    ->Args({12})
+//    ->Args({24});
+//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MPMCQueueAdaptor)
+//    ->Args({1})
+//    ->Args({2})
+//    ->Args({4})
+//    ->Args({8})
+//    ->Args({12})
+//    ->Args({24});
 
 template <typename QType>
 static void BM_multi_producer_multi_consumer_try(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/true>(
       state, state.range(0), state.range(0));
 }
-// BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MPSCQueue<int*>)
-//     ->Args({1})
-//     ->Args({2})
-//     ->Args({4})
-//     ->Args({6})
-//     ->Args({8})
-//     ->Args({12})
-//     ->Args({24});
-//
-BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MPMCQueue<int*>)
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MoodycamelAdaptor)
+    ->Args({1})
+    ->Args({2})
+    ->Args({4})
+    ->Args({6})
+    ->Args({8})
+    ->Args({12})
+    ->Args({24});
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MPMCQueueAdaptor)
     ->Args({1})
     ->Args({2})
     ->Args({4})
@@ -155,7 +202,15 @@ static void BM_multi_producer_multi_consumer(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/false>(
       state, state.range(0), state.range(0));
 }
-BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MPMCQueue<int*>)
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MoodycamelAdaptor)
+    ->Args({1})
+    ->Args({2})
+    ->Args({4})
+    ->Args({6})
+    ->Args({8})
+    ->Args({12})
+    ->Args({24});
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MPMCQueueAdaptor)
     ->Args({1})
     ->Args({2})
     ->Args({4})

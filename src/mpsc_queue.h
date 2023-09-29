@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "concepts.h"
+#include "defs.h"
 #include "queue_opts.h"
 
 namespace theta {
