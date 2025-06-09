@@ -4,8 +4,8 @@
 #include <random>
 #include <shared_mutex>
 
-#include "mpmc_queue.h"
-#include "mpsc_queue.h"
+#include "theta/queue/mpmc-queue.h"
+#include "theta/queue/mpsc-queue.h"
 
 namespace theta {
 

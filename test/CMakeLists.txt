@@ -1,16 +1,14 @@
-enable_testing()
-
-add_executable(
-  queue_test
-  queue_test.cc
-)
-target_link_libraries(
-  queue_test
-  mpmc-queue
-  mpsc-queue
-  GTest::gmock
-  GTest::gtest_main
-)
-
+find_package(GTest REQUIRED)
+find_package(debug-utils CONFIG REQUIRED)
 include(GoogleTest)
-gtest_discover_tests(queue_test)
+
+add_executable(queue-test queue-test.cc)
+target_link_libraries(
+  queue-test PUBLIC GTest::gmock GTest::gtest_main theta::debug-utils
+                    theta::stacktrace-signal-handlers mpmc-queue mpsc-queue)
+gtest_discover_tests(queue-test)
+
+install(
+  TARGETS queue-test
+  EXPORT ${PROJECT_NAME}
+  DESTINATION $ENV{out}/bin/test)

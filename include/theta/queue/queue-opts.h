@@ -13,4 +13,3 @@ class QueueOpts {
  private:
   size_t max_size_{hardware_destructive_interference_size};
 };
-

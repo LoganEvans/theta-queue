@@ -9,8 +9,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "defs.h"
-#include "queue_opts.h"
+#include "theta/queue/defs.h"
+#include "theta/queue/queue-opts.h"
 
 namespace theta {
 

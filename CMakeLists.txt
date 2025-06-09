@@ -1,27 +1,44 @@
-cmake_minimum_required(VERSION 3.14)
-SET (CMAKE_C_COMPILER "/usr/bin/clang" CACHE STRING "C compiler" FORCE)
-SET (CMAKE_CXX_COMPILER "/usr/bin/clang++" CACHE STRING "C++ compiler" FORCE)
-project(Queue)
+cmake_minimum_required(VERSION 3.31)
+project(queue VERSION 0.1)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(FetchContent)
+add_compile_options(-fdiagnostics-color=always
+                    -Wno-unused-command-line-argument)
+add_link_options(-Wno-unused-command-line-argument)
 
-FetchContent_Declare(
-  googletest
-  URL https://github.com/google/googletest/archive/03597a01ee50ed33e9dfd640b249b4be3799d395.zip
-)
-# For Windows: Prevent overriding the parent project's compiler/linker settings
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+find_package(fmt CONFIG REQUIRED)
 
-FetchContent_Declare(
-  googlebench
-  URL https://github.com/google/benchmark/archive/refs/tags/v1.8.3.zip
-)
-FetchContent_MakeAvailable(googlebench)
+add_library(mpmc-queue INTERFACE
+            ${CMAKE_CURRENT_LIST_DIR}/include/theta/queue/mpmc-queue.h)
+target_include_directories(
+  mpmc-queue INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include/>)
+target_link_libraries(mpmc-queue INTERFACE atomic)
 
-add_subdirectory(bench)
-add_subdirectory(src)
-add_subdirectory(test)
+add_library(mpsc-queue INTERFACE
+            ${CMAKE_CURRENT_LIST_DIR}/include/theta/queue/mpsc-queue.h)
+target_include_directories(
+  mpsc-queue INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include/>)
+target_link_libraries(mpmc-queue INTERFACE atomic)
+
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif(BUILD_TESTING)
+
+if($ENV{BUILD_BENCHMARK})
+  add_subdirectory(third_party/atomic_queue)
+  add_subdirectory(benchmark)
+endif($ENV{BUILD_BENCHMARK})
+
+install(
+  TARGETS mpmc-queue mpsc-queue
+  EXPORT ${PROJECT_NAME}
+  DESTINATION $ENV{out}/lib)
+
+install(
+  EXPORT ${PROJECT_NAME}
+  DESTINATION $ENV{out}/lib/cmake
+  FILE ${PROJECT_NAME}-config.cmake
+  NAMESPACE theta::)

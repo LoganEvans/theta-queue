@@ -8,8 +8,8 @@
 #include <optional>
 #include <semaphore>
 
-#include "mpmc_queue.h"
-#include "mpsc_queue.h"
+#include "theta/queue/mpmc-queue.h"
+#include "theta/queue/mpsc-queue.h"
 
 namespace theta {
 
@@ -33,9 +33,7 @@ struct MPMCQueueAdaptor {
   MPMCQueue<int*> queue{QueueOpts{}.set_max_size(1024)};
 };
 
-#define BENCH_MOODYCAMEL 0
-#if BENCH_MOODYCAMEL
-struct MoodycamelAdaptor {
+struct atomic_queue_Adaptor {
   std::optional<int*> try_pop() {
     int* v;
     if (queue.try_pop(v)) {
@@ -59,7 +57,6 @@ struct MoodycamelAdaptor {
                             /*SPSC=*/false>
       queue;
 };
-#endif
 
 template <QueueType QType, bool kUseTry>
 static void producer_consumer(benchmark::State& state,
@@ -144,51 +141,47 @@ template <typename QType>
 static void BM_multi_producer_single_consumer(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/false>(state, state.range(0), 1);
 }
-//#if BENCH_MOODYCAMEL
-//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MoodycamelAdaptor)
-//    ->Args({1})
-//    ->Args({2})
-//    ->Args({4})
-//    ->Args({8})
-//    ->Args({12})
-//    ->Args({24});
-//#endif
-//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MPMCQueueAdaptor)
-//    ->Args({1})
-//    ->Args({2})
-//    ->Args({4})
-//    ->Args({8})
-//    ->Args({12})
-//    ->Args({24});
+// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, atomic_queue_Adaptor)
+//     ->Args({1})
+//     ->Args({2})
+//     ->Args({4})
+//     ->Args({8})
+//     ->Args({12})
+//     ->Args({24});
+// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer, MPMCQueueAdaptor)
+//     ->Args({1})
+//     ->Args({2})
+//     ->Args({4})
+//     ->Args({8})
+//     ->Args({12})
+//     ->Args({24});
 
 template <typename QType>
 static void BM_multi_producer_single_consumer_try(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/true>(state, state.range(0), 1);
 }
-//#if BENCH_MOODYCAMEL
-//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MoodycamelAdaptor)
-//    ->Args({1})
-//    ->Args({2})
-//    ->Args({4})
-//    ->Args({8})
-//    ->Args({12})
-//    ->Args({24});
-//#endif
-//BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MPMCQueueAdaptor)
-//    ->Args({1})
-//    ->Args({2})
-//    ->Args({4})
-//    ->Args({8})
-//    ->Args({12})
-//    ->Args({24});
+// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try,
+// atomic_queue_Adaptor)
+//     ->Args({1})
+//     ->Args({2})
+//     ->Args({4})
+//     ->Args({8})
+//     ->Args({12})
+//     ->Args({24});
+// BENCHMARK_TEMPLATE(BM_multi_producer_single_consumer_try, MPMCQueueAdaptor)
+//     ->Args({1})
+//     ->Args({2})
+//     ->Args({4})
+//     ->Args({8})
+//     ->Args({12})
+//     ->Args({24});
 
 template <typename QType>
 static void BM_multi_producer_multi_consumer_try(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/true>(
       state, state.range(0), state.range(0));
 }
-#if BENCH_MOODYCAMEL
-BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MoodycamelAdaptor)
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, atomic_queue_Adaptor)
     ->Args({1})
     ->Args({2})
     ->Args({4})
@@ -196,7 +189,6 @@ BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MoodycamelAdaptor)
     ->Args({8})
     ->Args({12})
     ->Args({24});
-#endif
 BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer_try, MPMCQueueAdaptor)
     ->Args({1})
     ->Args({2})
@@ -211,8 +203,7 @@ static void BM_multi_producer_multi_consumer(benchmark::State& state) {
   producer_consumer<QType, /*kUseTry=*/false>(
       state, state.range(0), state.range(0));
 }
-#if BENCH_MOODYCAMEL
-BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MoodycamelAdaptor)
+BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, atomic_queue_Adaptor)
     ->Args({1})
     ->Args({2})
     ->Args({4})
@@ -220,7 +211,6 @@ BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MoodycamelAdaptor)
     ->Args({8})
     ->Args({12})
     ->Args({24});
-#endif
 BENCHMARK_TEMPLATE(BM_multi_producer_multi_consumer, MPMCQueueAdaptor)
     ->Args({1})
     ->Args({2})
