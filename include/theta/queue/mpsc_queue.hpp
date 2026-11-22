@@ -70,7 +70,9 @@ class MPSCQueue {
         slots_(cap_) {}
 
   ~MPSCQueue() {
-    while (try_pop().has_value()) {
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      while (try_pop().has_value()) {
+      }
     }
   }
 
@@ -399,6 +401,8 @@ class MPSCQueue {
   const std::size_t mask_;
   const std::size_t shift_;
   queue::detail::TurnSlotArray<T> slots_;
+  queue::detail::StripedParkLot<16> prod_park_;
+  queue::detail::AsymmetricParkLot cons_park_;
 
   queue::detail::ContentionPrefetchGate pf_gate_;
 
@@ -407,9 +411,6 @@ class MPSCQueue {
 
   alignas(
       kHardwareDestructiveInterferenceSize) std::atomic<std::uint64_t> head_{0};
-
-  queue::detail::StripedParkLot<16> prod_park_;
-  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 // Specialization for `QueueOrder::PerProducer`: 2-Tier `rseq` + 7-slot SIMD CAM

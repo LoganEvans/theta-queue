@@ -13,13 +13,13 @@ struct QueueTestPeer {
   template <typename T, std::size_t kCap>
   [[nodiscard]] static std::uint8_t spsc_cons_blocking_mode(
       const SPSCQueue<T, kCap>& q) noexcept {
-    return q.cons_park_.blocking_active_.load(std::memory_order_acquire);
+    return AsymmetricParkLot::blocking_mode_slot(q.cons_park_);
   }
 
   template <typename T, std::size_t kCap>
   [[nodiscard]] static std::uint8_t mpmc_cons_blocking_mode(
       const MPMCQueue<T, kCap, QueueOrder::StrictFIFO>& q) noexcept {
-    return q.cons_park_.blocking_active_.load(std::memory_order_acquire);
+    return q.cons_park_.blocking_mode();
   }
 
   template <typename FastQueue>

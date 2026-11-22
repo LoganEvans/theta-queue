@@ -1023,5 +1023,65 @@ TEST(BulkAndDrainTest, SmallRingWrapAroundStripedParkWakeup) {
   EXPECT_EQ(sum.load(), 30U);
 }
 
+TEST(ConventionsAndPeerTest,
+     LazyParkConcurrentFirstActivationAndDepthOneDrain) {
+  // 1. Concurrent multi-thread first-park race on both AsymmetricParkLot
+  //    (`UMPSCQueue`) and StripedParkLot (`MPMCQueue`).
+  {
+    MPMCQueue<uint64_t, 32> mpmc;
+    EXPECT_EQ(queue::detail::QueueTestPeer::mpmc_cons_blocking_mode(mpmc), 0U);
+    constexpr std::ptrdiff_t kWaiters = 8;
+    std::barrier ready(kWaiters + 1);
+    std::atomic<uint64_t> sum{0};
+    std::vector<std::thread> consumers;
+    consumers.reserve(static_cast<std::size_t>(kWaiters));
+    for (std::ptrdiff_t i = 0; i < kWaiters; ++i) {
+      consumers.emplace_back([&]() {
+        ready.arrive_and_wait();
+        sum.fetch_add(mpmc.pop(), std::memory_order_relaxed);
+      });
+    }
+    ready.arrive_and_wait();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (queue::detail::QueueTestPeer::mpmc_cons_blocking_mode(mpmc) < 2U &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    EXPECT_GE(static_cast<unsigned>(
+                  queue::detail::QueueTestPeer::mpmc_cons_blocking_mode(mpmc)),
+              2U);
+    for (uint64_t v = 1U; v <= static_cast<uint64_t>(kWaiters); ++v) {
+      mpmc.push(v);
+    }
+    for (auto& t : consumers) {
+      t.join();
+    }
+    EXPECT_EQ(sum.load(),
+              static_cast<uint64_t>(kWaiters * (kWaiters + 1)) / 2U);
+  }
+
+  // 2. Depth-1 push/pop/empty/drain transitions across SPSC, USPSC, FastMPSC.
+  SPSCQueue<uint64_t, 16> spsc;
+  USPSCQueue<uint64_t, 3> uspsc;
+  FastMPSCQueue<uint64_t, 16> fmpsc;
+  for (uint64_t i = 1U; i <= 64U; ++i) {
+    ASSERT_TRUE(spsc.try_push(i));
+    ASSERT_EQ(spsc.try_pop(), i);
+    ASSERT_EQ(spsc.try_pop(), std::nullopt);
+    ASSERT_EQ(spsc.drain([](uint64_t) {}), 0U);
+
+    ASSERT_TRUE(uspsc.try_push(i));
+    ASSERT_EQ(uspsc.try_pop(), i);
+    ASSERT_EQ(uspsc.try_pop(), std::nullopt);
+    ASSERT_EQ(uspsc.drain([](uint64_t) {}), 0U);
+
+    ASSERT_TRUE(fmpsc.try_push(i));
+    ASSERT_EQ(fmpsc.try_pop(), i);
+    ASSERT_EQ(fmpsc.try_pop(), std::nullopt);
+    ASSERT_EQ(fmpsc.drain([](uint64_t) {}), 0U);
+  }
+}
+
 }  // namespace
 }  // namespace theta

@@ -117,69 +117,143 @@ struct ParkStripe {
   std::atomic<std::uint32_t> epoch{0};
 };
 
-// 128B-isolated 2-Tier eventcount:
-// - Tier 1 (`blocking_active_ == 0`, default until a thread actually parks):
-//   frameless `testb + jne` (`0` `LOCK`s, `0` `StoreLoad` fences, `0` `asm`).
-// - Tier 2 (`blocking_active_ != 0`, promoted once via a single
-// `SYS_membarrier`
-//   on the very first park): pairs `seq_cst` StoreLoad fence on notifiers with
-//   `waiters_.fetch_add` on sleepers in `src/queue.cpp` so subsequent parks
-//   need ZERO ongoing `SYS_membarrier` IPIs.
-class alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkLot {
+#if THETA_TSAN_ENABLED
+inline constexpr std::memory_order kParkFastLoadOrder =
+    std::memory_order_acquire;
+#else
+inline constexpr std::memory_order kParkFastLoadOrder =
+    std::memory_order_relaxed;
+#endif
+
+struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
+  std::atomic<std::uint32_t> waiters{0};
+  std::atomic<std::uint32_t> epoch{0};
+  std::atomic<std::uint8_t> mode{1};
+  ColdSpinLock activate_lock;
+};
+
+// Compact 8-byte lazy 2-Tier eventcount handle:
+// - Tier 1 (`state_ == nullptr`, default until a thread actually parks):
+//   frameless pointer test (`0` `LOCK`s, `0` `StoreLoad` fences, `0` `asm`,
+//   `0` heap allocs, and never escapes `&this` so unescaped local queues stay
+//   100% SROA-promotable into registers).
+// - Tier 2 (`state_ != nullptr`, allocated & promoted once via a single
+//   `SYS_membarrier` on the very first park): pairs `seq_cst` StoreLoad fence
+//   on notifiers with `waiters.fetch_add` on sleepers in `src/queue.cpp` so
+//   subsequent parks need ZERO ongoing `SYS_membarrier` IPIs.
+class AsymmetricParkLot {
   friend struct QueueTestPeer;
 
  public:
-  THETA_FORCE_INLINE void notify_if_waiters() noexcept {
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (blocking_active_.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
-      notify_active_slow();
+  constexpr AsymmetricParkLot() noexcept = default;
+
+  ~AsymmetricParkLot() {
+    if (auto* s = state_.load(std::memory_order_relaxed); s != nullptr)
+        [[unlikely]] {
+      destroy_state_slow(s);
     }
   }
 
+  AsymmetricParkLot(const AsymmetricParkLot&) = delete;
+  AsymmetricParkLot& operator=(const AsymmetricParkLot&) = delete;
+  AsymmetricParkLot(AsymmetricParkLot&&) = delete;
+  AsymmetricParkLot& operator=(AsymmetricParkLot&&) = delete;
+
+  THETA_FORCE_INLINE void notify_if_waiters() noexcept { notify_slot(state_); }
+
+  [[nodiscard]] std::uint8_t blocking_mode() const noexcept {
+    return blocking_mode_slot(state_);
+  }
+
   template <typename StopPred>
-  THETA_ALIGNED_NOINLINE void wait_until(StopPred&& pred) noexcept;
+  THETA_ALIGNED_NOINLINE void wait_until(StopPred&& pred) noexcept {
+    wait_slot_until(state_, std::forward<StopPred>(pred));
+  }
+
+  static THETA_FORCE_INLINE void notify_slot(
+      std::atomic<AsymmetricParkState*>& slot) noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (auto* s = slot.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
+      notify_active_slow(s);
+    }
+  }
+
+  [[nodiscard]] static std::uint8_t blocking_mode_slot(
+      const std::atomic<AsymmetricParkState*>& slot) noexcept {
+    const auto* s = slot.load(std::memory_order_acquire);
+    return s != nullptr ? s->mode.load(std::memory_order_acquire) : 0U;
+  }
+
+  template <typename StopPred>
+  static THETA_ALIGNED_NOINLINE void wait_slot_until(
+      std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept;
 
  private:
-  [[gnu::cold]] void notify_active_slow() noexcept;
-  [[gnu::cold]] void notify_slow() noexcept;
-  [[gnu::cold]] std::uint8_t activate_blocking_once() noexcept;
-  [[gnu::cold]] void park_epoch(std::uint32_t ep, std::uint8_t mode) noexcept;
+  [[gnu::cold]] static void notify_active_slow(AsymmetricParkState* s) noexcept;
+  [[gnu::cold]] static AsymmetricParkState* get_or_activate_state_slow(
+      std::atomic<AsymmetricParkState*>& slot, std::uint8_t& out_mode) noexcept;
+  [[gnu::cold]] static void park_epoch(AsymmetricParkState* s, std::uint32_t ep,
+                                       std::uint8_t mode) noexcept;
+  [[gnu::cold]] static void destroy_state_slow(AsymmetricParkState* s) noexcept;
 
-  std::atomic<std::uint32_t> waiters_{0};
-  std::atomic<std::uint32_t> epoch_{0};
-  std::atomic<std::uint8_t> blocking_active_{0};
-  ColdSpinLock activate_lock_;
+  std::atomic<AsymmetricParkState*> state_{nullptr};
+};
+
+void destroy_spsc_core(void* slots, std::size_t align,
+                       AsymmetricParkState* prod,
+                       AsymmetricParkState* cons) noexcept;
+
+struct alignas(kHardwareDestructiveInterferenceSize) StripedParkState {
+  static constexpr std::size_t kMaxStripes = 16;
+
+  std::atomic<std::uint8_t> mode{1};
+  ColdSpinLock activate_lock;
+  std::array<ParkStripe, kMaxStripes> stripes{};
 };
 
 struct StripedParkLotBase {
-  [[gnu::cold]] static std::uint8_t activate_blocking_once(
-      std::atomic<std::uint8_t>& blocking_active,
-      ColdSpinLock& activate_lock) noexcept;
-  [[gnu::cold]] static void notify_stripe_slow(ParkStripe& stripe) noexcept;
+  [[gnu::cold]] static StripedParkState* get_or_activate_state_slow(
+      std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept;
   [[gnu::cold]] static void notify_ticket_active_slow(
-      ParkStripe& stripe) noexcept;
+      StripedParkState* state, std::size_t stripe_idx) noexcept;
   [[gnu::cold]] static void notify_range_active_slow(
-      ParkStripe* stripes, std::size_t ring_mask, std::size_t stripe_mask,
+      StripedParkState* state, std::size_t ring_mask, std::size_t stripe_mask,
       std::uint64_t base_ticket, std::size_t count) noexcept;
   [[gnu::cold]] static void park_stripe_epoch(ParkStripe& stripe,
                                               std::uint32_t ep,
                                               std::uint8_t mode) noexcept;
+  [[gnu::cold]] static void destroy_state_slow(StripedParkState* s) noexcept;
 };
 
-// Ticket-striped 2-Tier eventcount: eliminates BOTH thundering-herd wakeups on
-// oversubscribed MPMC/MPSC queues AND ongoing `SYS_membarrier` IPIs on park.
+// Compact 8-byte lazy ticket-striped 2-Tier eventcount: eliminates thundering
+// herds, ongoing `SYS_membarrier` IPIs, and non-blocking stripe footprint.
 template <std::size_t kStripes = 16>
-class alignas(kHardwareDestructiveInterferenceSize) StripedParkLot {
-  static_assert((kStripes & (kStripes - 1U)) == 0U && kStripes >= 2U);
+class StripedParkLot {
+  static_assert((kStripes & (kStripes - 1U)) == 0U && kStripes >= 2U &&
+                kStripes <= StripedParkState::kMaxStripes);
   static constexpr std::size_t kStripeMask = kStripes - 1U;
   friend struct QueueTestPeer;
 
  public:
+  constexpr StripedParkLot() noexcept = default;
+
+  ~StripedParkLot() {
+    if (auto* s = state_.load(std::memory_order_relaxed); s != nullptr)
+        [[unlikely]] {
+      StripedParkLotBase::destroy_state_slow(s);
+    }
+  }
+
+  StripedParkLot(const StripedParkLot&) = delete;
+  StripedParkLot& operator=(const StripedParkLot&) = delete;
+  StripedParkLot(StripedParkLot&&) = delete;
+  StripedParkLot& operator=(StripedParkLot&&) = delete;
+
   THETA_FORCE_INLINE void notify_ticket(std::uint64_t ticket) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (blocking_active_.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
+    if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
       StripedParkLotBase::notify_ticket_active_slow(
-          stripes_[static_cast<std::size_t>(ticket) & kStripeMask]);
+          s, static_cast<std::size_t>(ticket) & kStripeMask);
     }
   }
 
@@ -187,10 +261,15 @@ class alignas(kHardwareDestructiveInterferenceSize) StripedParkLot {
                                        std::size_t count,
                                        std::size_t ring_mask) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (blocking_active_.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
-      StripedParkLotBase::notify_range_active_slow(
-          stripes_.data(), ring_mask, kStripeMask, base_ticket, count);
+    if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
+      StripedParkLotBase::notify_range_active_slow(s, ring_mask, kStripeMask,
+                                                   base_ticket, count);
     }
+  }
+
+  [[nodiscard]] std::uint8_t blocking_mode() const noexcept {
+    const auto* s = state_.load(std::memory_order_acquire);
+    return s != nullptr ? s->mode.load(std::memory_order_acquire) : 0U;
   }
 
   template <typename StopPred>
@@ -198,9 +277,7 @@ class alignas(kHardwareDestructiveInterferenceSize) StripedParkLot {
                                           StopPred&& pred) noexcept;
 
  private:
-  std::atomic<std::uint8_t> blocking_active_{0};
-  ColdSpinLock activate_lock_;
-  std::array<ParkStripe, kStripes> stripes_{};
+  std::atomic<StripedParkState*> state_{nullptr};
 };
 
 inline constexpr std::uint8_t kMaxRseqPreferred = 7U;

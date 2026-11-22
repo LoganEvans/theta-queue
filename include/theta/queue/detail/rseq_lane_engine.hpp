@@ -322,7 +322,14 @@ class RseqLaneEngine {
     const std::uint8_t cur_idx = core_.sc_cursor;
     LaneMeta& m = core_.meta[cur_idx];
     const std::uint64_t h = m.head;
-    if (h != m.tail_cache && core_.sc_quantum != 0U) [[likely]] {
+    if (core_.sc_quantum != 0U) [[likely]] {
+      if (h == m.tail_cache) {
+        const std::uint64_t tc = __atomic_load_n(&m.tail, __ATOMIC_ACQUIRE);
+        if (h == tc) {
+          return try_pop_word_sc_slow(out);
+        }
+        m.tail_cache = tc;
+      }
       --core_.sc_quantum;
       out = m.data_cons[h & m.mask_cons];
       __atomic_store_n(&m.head, h + 1U, __ATOMIC_RELEASE);
@@ -504,7 +511,7 @@ class RseqLaneEngine {
 
   RseqLaneCore core_{};
   FallbackQueue fallback_;
-  AsymmetricParkLot prod_park_;
+  alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkLot prod_park_;
   AsymmetricParkLot cons_park_;
 };
 

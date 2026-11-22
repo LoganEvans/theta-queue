@@ -119,63 +119,105 @@ asymmetric_membarrier_rseq_expedited() noexcept {
   return false;
 }
 
-[[gnu::noinline, gnu::aligned(64)]] void
-AsymmetricParkLot::notify_active_slow() noexcept {
+[[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::notify_active_slow(
+    AsymmetricParkState* s) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (waiters_.load(std::memory_order_seq_cst) != 0U) [[unlikely]] {
-    epoch_.fetch_add(1U, std::memory_order_seq_cst);
-    futex_wake_all_u32(&epoch_);
+  if (s->waiters.load(std::memory_order_seq_cst) != 0U) [[unlikely]] {
+    s->epoch.fetch_add(1U, std::memory_order_seq_cst);
+    futex_wake_all_u32(&s->epoch);
   }
 }
 
-[[gnu::noinline, gnu::aligned(64)]] void
-AsymmetricParkLot::notify_slow() noexcept {
-  epoch_.fetch_add(1U, std::memory_order_seq_cst);
-  futex_wake_all_u32(&epoch_);
-}
-
-[[gnu::noinline, gnu::aligned(64)]] std::uint8_t
-AsymmetricParkLot::activate_blocking_once() noexcept {
-  const ColdSpinGuard guard(activate_lock_);
-  std::uint8_t mode = blocking_active_.load(std::memory_order_relaxed);
-  if (mode < 2U) {
-    blocking_active_.store(1U, std::memory_order_seq_cst);
-    const bool ok = asymmetric_membarrier_expedited();
-    mode = ok ? 2U : 3U;
-    blocking_active_.store(mode, std::memory_order_release);
+[[gnu::noinline, gnu::aligned(64)]] AsymmetricParkState*
+AsymmetricParkLot::get_or_activate_state_slow(
+    std::atomic<AsymmetricParkState*>& slot, std::uint8_t& out_mode) noexcept {
+  AsymmetricParkState* s = slot.load(std::memory_order_acquire);
+  if (s == nullptr) {
+    auto* fresh = aligned_alloc_uninit<AsymmetricParkState>(1U);
+    std::construct_at(fresh);
+    if (slot.compare_exchange_strong(s, fresh, std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+      s = fresh;
+    } else {
+      std::destroy_at(fresh);
+      aligned_free_uninit(fresh);
+    }
   }
-  return mode;
+  std::uint8_t m = s->mode.load(std::memory_order_acquire);
+  if (m < 2U) {
+    const ColdSpinGuard guard(s->activate_lock);
+    m = s->mode.load(std::memory_order_relaxed);
+    if (m < 2U) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      const bool ok = asymmetric_membarrier_expedited();
+      m = ok ? 2U : 3U;
+      s->mode.store(m, std::memory_order_release);
+    }
+  }
+  out_mode = m;
+  return s;
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::park_epoch(
-    std::uint32_t ep, std::uint8_t mode) noexcept {
-  futex_park_u32(&epoch_, ep, mode);
+    AsymmetricParkState* s, std::uint32_t ep, std::uint8_t mode) noexcept {
+  futex_park_u32(&s->epoch, ep, mode);
 }
 
-[[gnu::noinline, gnu::aligned(64)]] std::uint8_t
-StripedParkLotBase::activate_blocking_once(
-    std::atomic<std::uint8_t>& blocking_active,
-    ColdSpinLock& activate_lock) noexcept {
-  const ColdSpinGuard guard(activate_lock);
-  std::uint8_t mode = blocking_active.load(std::memory_order_relaxed);
-  if (mode < 2U) {
-    blocking_active.store(1U, std::memory_order_seq_cst);
-    const bool ok = asymmetric_membarrier_expedited();
-    mode = ok ? 2U : 3U;
-    blocking_active.store(mode, std::memory_order_release);
+[[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::destroy_state_slow(
+    AsymmetricParkState* s) noexcept {
+  std::destroy_at(s);
+  aligned_free_uninit(s);
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void destroy_spsc_core(
+    void* slots, std::size_t align, AsymmetricParkState* prod,
+    AsymmetricParkState* cons) noexcept {
+  ::operator delete[](slots, std::align_val_t{align});
+  if (prod != nullptr) [[unlikely]] {
+    std::destroy_at(prod);
+    aligned_free_uninit(prod);
   }
-  return mode;
+  if (cons != nullptr) [[unlikely]] {
+    std::destroy_at(cons);
+    aligned_free_uninit(cons);
+  }
 }
 
-[[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::notify_stripe_slow(
-    ParkStripe& stripe) noexcept {
-  stripe.epoch.fetch_add(1U, std::memory_order_seq_cst);
-  futex_wake_all_u32(&stripe.epoch);
+[[gnu::noinline, gnu::aligned(64)]] StripedParkState*
+StripedParkLotBase::get_or_activate_state_slow(
+    std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept {
+  StripedParkState* s = slot.load(std::memory_order_acquire);
+  if (s == nullptr) {
+    auto* fresh = aligned_alloc_uninit<StripedParkState>(1U);
+    std::construct_at(fresh);
+    if (slot.compare_exchange_strong(s, fresh, std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+      s = fresh;
+    } else {
+      std::destroy_at(fresh);
+      aligned_free_uninit(fresh);
+    }
+  }
+  std::uint8_t m = s->mode.load(std::memory_order_acquire);
+  if (m < 2U) {
+    const ColdSpinGuard guard(s->activate_lock);
+    m = s->mode.load(std::memory_order_relaxed);
+    if (m < 2U) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      const bool ok = asymmetric_membarrier_expedited();
+      m = ok ? 2U : 3U;
+      s->mode.store(m, std::memory_order_release);
+    }
+  }
+  out_mode = m;
+  return s;
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void
-StripedParkLotBase::notify_ticket_active_slow(ParkStripe& stripe) noexcept {
+StripedParkLotBase::notify_ticket_active_slow(StripedParkState* state,
+                                              std::size_t stripe_idx) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  ParkStripe& stripe = state->stripes[stripe_idx];
   if (stripe.waiters.load(std::memory_order_seq_cst) != 0U) [[unlikely]] {
     stripe.epoch.fetch_add(1U, std::memory_order_seq_cst);
     futex_wake_all_u32(&stripe.epoch);
@@ -183,12 +225,13 @@ StripedParkLotBase::notify_ticket_active_slow(ParkStripe& stripe) noexcept {
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void
-StripedParkLotBase::notify_range_active_slow(ParkStripe* stripes,
+StripedParkLotBase::notify_range_active_slow(StripedParkState* state,
                                              std::size_t ring_mask,
                                              std::size_t stripe_mask,
                                              std::uint64_t base_ticket,
                                              std::size_t count) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  ParkStripe* stripes = state->stripes.data();
   const std::size_t max_unique = std::min(ring_mask + 1U, stripe_mask + 1U);
   const std::size_t n = std::min(count, max_unique);
   THETA_SCALAR_LOOP
@@ -206,6 +249,12 @@ StripedParkLotBase::notify_range_active_slow(ParkStripe* stripes,
 [[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::park_stripe_epoch(
     ParkStripe& stripe, std::uint32_t ep, std::uint8_t mode) noexcept {
   futex_park_u32(&stripe.epoch, ep, mode);
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::destroy_state_slow(
+    StripedParkState* s) noexcept {
+  std::destroy_at(s);
+  aligned_free_uninit(s);
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void RseqLaneCore::init(

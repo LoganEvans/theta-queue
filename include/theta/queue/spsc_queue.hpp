@@ -38,6 +38,8 @@ class SPSCQueue {
 
   friend struct queue::detail::QueueTestPeer;
   using Slot = queue::detail::RawSlotStorage<T>;
+  static constexpr std::size_t kSlotAlign = std::max<std::size_t>(
+      kHardwareDestructiveInterferenceSize, alignof(Slot));
 
   static constexpr std::size_t resolve_ring_len(
       const QueueOpts& opts) noexcept {
@@ -62,14 +64,18 @@ class SPSCQueue {
   }
 
   ~SPSCQueue() {
-    std::size_t h = head_.load(std::memory_order_relaxed);
-    const std::size_t t = tail_.load(std::memory_order_relaxed);
-    const std::size_t m = ring_mask();
-    while (h != t) {
-      slots_[h].destroy();
-      h = (h + 1U) & m;
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      std::size_t h = head_.load(std::memory_order_relaxed);
+      const std::size_t t = tail_.load(std::memory_order_relaxed);
+      const std::size_t m = ring_mask();
+      while (h != t) {
+        slots_[h].destroy();
+        h = (h + 1U) & m;
+      }
     }
-    queue::detail::aligned_free_uninit(slots_);
+    queue::detail::destroy_spsc_core(
+        slots_, kSlotAlign, prod_park_.load(std::memory_order_relaxed),
+        cons_park_.load(std::memory_order_relaxed));
   }
 
   SPSCQueue(const SPSCQueue&) = delete;
@@ -85,14 +91,15 @@ class SPSCQueue {
     const std::size_t t = tail_.load(std::memory_order_relaxed);
     const std::size_t next = (t + 1U) & m;
     if (next == head_cache_) [[unlikely]] {
-      head_cache_ = head_.load(std::memory_order_acquire);
-      if (next == head_cache_) {
+      const std::size_t hc = head_.load(std::memory_order_acquire);
+      if (next == hc) {
         return false;
       }
+      head_cache_ = hc;
     }
     slots_[t].construct(std::forward<Args>(args)...);
     tail_.store(next, std::memory_order_release);
-    cons_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(cons_park_);
     return true;
   }
 
@@ -149,7 +156,7 @@ class SPSCQueue {
     }
 
     tail_.store((t + n) & m, std::memory_order_release);
-    cons_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(cons_park_);
     return n;
   }
 
@@ -163,15 +170,16 @@ class SPSCQueue {
     if (next == head_cache_) [[unlikely]] {
       head_cache_ = head_.load(std::memory_order_acquire);
       if (next == head_cache_) {
-        prod_park_.wait_until([this, next]() noexcept {
-          head_cache_ = head_.load(std::memory_order_acquire);
-          return next != head_cache_;
-        });
+        queue::detail::AsymmetricParkLot::wait_slot_until(
+            prod_park_, [this, next]() noexcept {
+              head_cache_ = head_.load(std::memory_order_acquire);
+              return next != head_cache_;
+            });
       }
     }
     slots_[t].construct(std::forward<Args>(args)...);
     tail_.store(next, std::memory_order_release);
-    cons_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(cons_park_);
   }
 
   void push(const T& val) noexcept(std::is_nothrow_copy_constructible_v<T>)
@@ -185,28 +193,30 @@ class SPSCQueue {
   std::optional<T> try_pop() noexcept {
     const std::size_t h = head_.load(std::memory_order_relaxed);
     if (h == tail_cache_) {
-      tail_cache_ = tail_.load(std::memory_order_acquire);
-      if (h == tail_cache_) {
+      const std::size_t tc = tail_.load(std::memory_order_acquire);
+      if (h == tc) {
         return std::nullopt;
       }
+      tail_cache_ = tc;
     }
     std::optional<T> out{slots_[h].move_and_destroy()};
     head_.store((h + 1U) & ring_mask(), std::memory_order_release);
-    prod_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(prod_park_);
     return out;
   }
 
   bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
     const std::size_t h = head_.load(std::memory_order_relaxed);
     if (h == tail_cache_) {
-      tail_cache_ = tail_.load(std::memory_order_acquire);
-      if (h == tail_cache_) {
+      const std::size_t tc = tail_.load(std::memory_order_acquire);
+      if (h == tc) {
         return false;
       }
+      tail_cache_ = tc;
     }
     slots_[h].move_into_and_destroy(out);
     head_.store((h + 1U) & ring_mask(), std::memory_order_release);
-    prod_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(prod_park_);
     return true;
   }
 
@@ -248,7 +258,7 @@ class SPSCQueue {
     }
 
     head_.store((h + n) & m, std::memory_order_release);
-    prod_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(prod_park_);
     return n;
   }
 
@@ -280,7 +290,7 @@ class SPSCQueue {
         if (*count > 0U) {
           self->head_.store((start_h + *count) & mask,
                             std::memory_order_release);
-          self->prod_park_.notify_if_waiters();
+          queue::detail::AsymmetricParkLot::notify_slot(self->prod_park_);
         }
       }
     } commit{this, h, m, &consumed};
@@ -303,15 +313,16 @@ class SPSCQueue {
     if (h == tail_cache_) {
       tail_cache_ = tail_.load(std::memory_order_acquire);
       if (h == tail_cache_) {
-        cons_park_.wait_until([this, h]() noexcept {
-          tail_cache_ = tail_.load(std::memory_order_acquire);
-          return h != tail_cache_;
-        });
+        queue::detail::AsymmetricParkLot::wait_slot_until(
+            cons_park_, [this, h]() noexcept {
+              tail_cache_ = tail_.load(std::memory_order_acquire);
+              return h != tail_cache_;
+            });
       }
     }
     T out{slots_[h].move_and_destroy()};
     head_.store((h + 1U) & ring_mask(), std::memory_order_release);
-    prod_park_.notify_if_waiters();
+    queue::detail::AsymmetricParkLot::notify_slot(prod_park_);
     return out;
   }
 
@@ -344,6 +355,8 @@ class SPSCQueue {
 
   const std::size_t mask_;
   Slot* const slots_;
+  std::atomic<queue::detail::AsymmetricParkState*> prod_park_{nullptr};
+  std::atomic<queue::detail::AsymmetricParkState*> cons_park_{nullptr};
 
   alignas(kHardwareDestructiveInterferenceSize) std::atomic<std::size_t> tail_{
       0};
@@ -352,9 +365,6 @@ class SPSCQueue {
   alignas(kHardwareDestructiveInterferenceSize) std::atomic<std::size_t> head_{
       0};
   std::size_t tail_cache_{0};
-
-  queue::detail::AsymmetricParkLot prod_park_;
-  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 }  // namespace theta

@@ -85,7 +85,9 @@ class UnboundedQueue<T, true, true, kLgSlab> {
   }
 
   ~UnboundedQueue() {
-    while (try_pop().has_value()) {
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      while (try_pop().has_value()) {
+      }
     }
     Slab* cur = cons_slab_;
     while (cur != nullptr) {
@@ -175,38 +177,55 @@ class UnboundedQueue<T, true, true, kLgSlab> {
 
   std::optional<T> try_pop() noexcept {
     const std::uint64_t r = cons_r_;
-    if (r != cons_w_cache_) [[likely]] {
-      std::optional<T> out{cons_slab_->data[static_cast<std::size_t>(r) & kMask]
-                               .move_and_destroy()};
-      cons_r_ = r + 1U;
-      if (cons_is_same_slab_) [[likely]] {
-        active_read_pos_.store(r + 1U, std::memory_order_release);
-      } else {
-        total_popped_.store(r + 1U, std::memory_order_relaxed);
+    Slab* s = cons_slab_;
+    if (r == cons_w_cache_) {
+      const std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
+      if (r == w) {
+        if (s->next.load(std::memory_order_acquire) == nullptr) [[likely]] {
+          return std::nullopt;
+        }
+        return pop_advance_slab_slow(r);
       }
-      return out;
+      cons_w_cache_ = w;
+      cons_is_same_slab_ = (s->next.load(std::memory_order_relaxed) == nullptr);
     }
-    return pop_slow_opt(r);
+    std::optional<T> out{
+        s->data[static_cast<std::size_t>(r) & kMask].move_and_destroy()};
+    cons_r_ = r + 1U;
+    if (cons_is_same_slab_) [[likely]] {
+      active_read_pos_.store(r + 1U, std::memory_order_release);
+    } else {
+      total_popped_.store(r + 1U, std::memory_order_relaxed);
+    }
+    return out;
   }
 
   bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
     const std::uint64_t r = cons_r_;
-    if (r != cons_w_cache_) [[likely]] {
-      cons_slab_->data[static_cast<std::size_t>(r) & kMask]
-          .move_into_and_destroy(out);
-      cons_r_ = r + 1U;
-      if (cons_is_same_slab_) [[likely]] {
-        active_read_pos_.store(r + 1U, std::memory_order_release);
-      } else {
-        total_popped_.store(r + 1U, std::memory_order_relaxed);
+    Slab* s = cons_slab_;
+    if (r == cons_w_cache_) {
+      const std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
+      if (r == w) {
+        if (s->next.load(std::memory_order_acquire) == nullptr) [[likely]] {
+          return false;
+        }
+        std::optional<T> slow = pop_advance_slab_slow(r);
+        if (!slow.has_value()) {
+          return false;
+        }
+        out = std::move(*slow);
+        return true;
       }
-      return true;
+      cons_w_cache_ = w;
+      cons_is_same_slab_ = (s->next.load(std::memory_order_relaxed) == nullptr);
     }
-    std::optional<T> slow = pop_slow_opt(r);
-    if (!slow.has_value()) {
-      return false;
+    s->data[static_cast<std::size_t>(r) & kMask].move_into_and_destroy(out);
+    cons_r_ = r + 1U;
+    if (cons_is_same_slab_) [[likely]] {
+      active_read_pos_.store(r + 1U, std::memory_order_release);
+    } else {
+      total_popped_.store(r + 1U, std::memory_order_relaxed);
     }
-    out = std::move(*slow);
     return true;
   }
 
@@ -228,42 +247,51 @@ class UnboundedQueue<T, true, true, kLgSlab> {
     std::size_t total = 0U;
     while (total < max_count) {
       const std::uint64_t r = cons_r_;
-      if (r != cons_w_cache_) [[likely]] {
-        const auto avail = static_cast<std::size_t>(cons_w_cache_ - r);
-        const std::size_t limit = std::min(max_count - total, avail);
-        std::size_t consumed = 0U;
-        bool stop = false;
-        for (; consumed < limit; ++consumed) {
-          Slot& slot =
-              cons_slab_->data[static_cast<std::size_t>(r + consumed) & kMask];
-          T* p = slot.ptr();
-          const bool cont =
-              queue::detail::invoke_drain_visitor(fn, std::move(*p));
-          std::destroy_at(p);
-          if (!cont) {
-            ++consumed;
-            stop = true;
+      Slab* s = cons_slab_;
+      if (r == cons_w_cache_) {
+        const std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
+        if (r == w) {
+          if (s->next.load(std::memory_order_acquire) == nullptr) [[likely]] {
             break;
           }
+          std::optional<T> slow = pop_advance_slab_slow(r);
+          if (!slow.has_value()) {
+            break;
+          }
+          ++total;
+          if (!queue::detail::invoke_drain_visitor(fn, std::move(*slow))) {
+            break;
+          }
+          continue;
         }
-        cons_r_ = r + consumed;
-        if (cons_is_same_slab_) [[likely]] {
-          active_read_pos_.store(r + consumed, std::memory_order_release);
-        } else {
-          total_popped_.store(r + consumed, std::memory_order_relaxed);
-        }
-        total += consumed;
-        if (stop) {
+        cons_w_cache_ = w;
+        cons_is_same_slab_ =
+            (s->next.load(std::memory_order_relaxed) == nullptr);
+      }
+      const auto avail = static_cast<std::size_t>(cons_w_cache_ - r);
+      const std::size_t limit = std::min(max_count - total, avail);
+      std::size_t consumed = 0U;
+      bool stop = false;
+      for (; consumed < limit; ++consumed) {
+        Slot& slot = s->data[static_cast<std::size_t>(r + consumed) & kMask];
+        T* p = slot.ptr();
+        const bool cont =
+            queue::detail::invoke_drain_visitor(fn, std::move(*p));
+        std::destroy_at(p);
+        if (!cont) {
+          ++consumed;
+          stop = true;
           break;
         }
-        continue;
       }
-      std::optional<T> slow = pop_slow_opt(r);
-      if (!slow.has_value()) {
-        break;
+      cons_r_ = r + consumed;
+      if (cons_is_same_slab_) [[likely]] {
+        active_read_pos_.store(r + consumed, std::memory_order_release);
+      } else {
+        total_popped_.store(r + consumed, std::memory_order_relaxed);
       }
-      ++total;
-      if (!queue::detail::invoke_drain_visitor(fn, std::move(*slow))) {
+      total += consumed;
+      if (stop) {
         break;
       }
     }
@@ -332,28 +360,14 @@ class UnboundedQueue<T, true, true, kLgSlab> {
     cons_park_.notify_if_waiters();
   }
 
-  THETA_ALIGNED_NOINLINE std::optional<T> pop_slow_opt(
+  THETA_ALIGNED_NOINLINE std::optional<T> pop_advance_slab_slow(
       std::uint64_t r) noexcept {
     Slab* s = cons_slab_;
-    std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
-    if (r != w) [[likely]] {
-      cons_w_cache_ = w;
-      cons_is_same_slab_ = (s->next.load(std::memory_order_relaxed) == nullptr);
-      std::optional<T> out{
-          s->data[static_cast<std::size_t>(r) & kMask].move_and_destroy()};
-      cons_r_ = r + 1U;
-      if (cons_is_same_slab_) {
-        active_read_pos_.store(r + 1U, std::memory_order_release);
-      } else {
-        total_popped_.store(r + 1U, std::memory_order_relaxed);
-      }
-      return out;
-    }
     Slab* nxt = s->next.load(std::memory_order_acquire);
     if (nxt == nullptr) {
       return std::nullopt;
     }
-    w = s->write_pos.load(std::memory_order_acquire);
+    const std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
     if (r != w) {
       cons_w_cache_ = w;
       cons_is_same_slab_ = false;
@@ -402,6 +416,9 @@ class UnboundedQueue<T, true, true, kLgSlab> {
         head, s, std::memory_order_release, std::memory_order_relaxed));
   }
 
+  alignas(kHardwareDestructiveInterferenceSize) queue::detail::AsymmetricParkLot
+      cons_park_;
+
   alignas(kHardwareDestructiveInterferenceSize) Slab* prod_slab_{nullptr};
   std::uint64_t prod_w_{0};
   std::uint64_t prod_r_cache_{0};
@@ -418,7 +435,6 @@ class UnboundedQueue<T, true, true, kLgSlab> {
   std::atomic<Slab*> active_cons_slab_{nullptr};
   alignas(kHardwareDestructiveInterferenceSize) std::atomic<Slab*> free_head_{
       nullptr};
-  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 // ============================================================================
@@ -467,7 +483,9 @@ class UnboundedQueue {
   }
 
   ~UnboundedQueue() {
-    while (try_pop().has_value()) {
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      while (try_pop().has_value()) {
+      }
     }
     const Slab* cur = all_slabs_.load(std::memory_order_relaxed);
     while (cur != nullptr) {
@@ -914,7 +932,8 @@ class UnboundedQueue {
   std::size_t pool_count_ THETA_QUEUE_GUARDED_BY(pool_lock_){0};
   std::atomic<Slab*> all_slabs_{nullptr};
 
-  queue::detail::AsymmetricParkLot cons_park_;
+  alignas(kHardwareDestructiveInterferenceSize) queue::detail::AsymmetricParkLot
+      cons_park_;
 };
 
 template <QueueElement T, std::size_t kLgSlab = 9>

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -538,6 +539,28 @@ void BM_SingleThreadTryRoundtrip(  // NOLINT(readability-identifier-naming)
   state.SetItemsProcessed(state.iterations());
 }
 
+// Escapes `&queue` on the heap before the benchmark loop so LLVM SROA cannot
+// promote `std::atomic` indices into scalar CPU registers — measuring genuine
+// memory atomics and acquire/release barriers on both header-only and
+// compiled-slow-path queues.
+template <NonBlockingQueueAdaptor QType>
+void BM_SingleThreadEscapedRoundtrip(  // NOLINT(readability-identifier-naming)
+    benchmark::State& state) {
+  pin_thread_to_core(0, 1);
+  const auto queue_ptr = std::make_unique<QType>();
+  QType* q = queue_ptr.get();
+  benchmark::DoNotOptimize(q);
+  int payload = 42;
+
+  for (const auto _ : state) {
+    bool ok = q->try_push(&payload);
+    benchmark::DoNotOptimize(ok);
+    auto out = q->try_pop();
+    benchmark::DoNotOptimize(out);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
 // ---------------------------------------------------------------------------
 // 2. Cross-Core Ping-Pong Handoff Latency (2 Physical Cores)
 // ---------------------------------------------------------------------------
@@ -787,6 +810,22 @@ BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, AbslMutexRingAdaptor);
 #endif
 #if defined(THETA_QUEUE_HAS_THETA_MUTEX)
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaMutexRingAdaptor);
+#endif
+
+// Group 1b: Single-thread roundtrip with escaped queue (real memory atomics)
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, ThetaSPSCStaticAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, ThetaUSPSCAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, ThetaFastMPSCAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, ThetaFastMPMCAdaptor);
+#if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, AtomicQueueSPSCAdaptor);
+#endif
+#if defined(THETA_QUEUE_HAS_FOLLY)
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, FollySPSCAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, FollyUSPSCAdaptor);
+#endif
+#if defined(THETA_QUEUE_HAS_BOOST)
+BENCHMARK_TEMPLATE(BM_SingleThreadEscapedRoundtrip, BoostLockfreeSPSCAdaptor);
 #endif
 
 // Group 2: Cross-core ping-pong latency

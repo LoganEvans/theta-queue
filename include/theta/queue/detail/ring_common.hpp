@@ -56,9 +56,10 @@ class alignas(kHardwareDestructiveInterferenceSize) ContentionPrefetchGate {
 };
 
 template <typename StopPred>
-THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_until(
-    StopPred&& pred) noexcept {
-  if (waiters_.load(std::memory_order_relaxed) == 0U) {
+THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
+    std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept {
+  AsymmetricParkState* s = slot.load(std::memory_order_acquire);
+  if (s == nullptr || s->waiters.load(std::memory_order_relaxed) == 0U) {
     THETA_DISABLE_UNROLL
     for (int spin = 0; spin < 20; ++spin) {
       if (pred()) {
@@ -75,16 +76,21 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_until(
     }
   }
   while (!pred()) {
-    const std::uint32_t ep = epoch_.load(std::memory_order_relaxed);
-    waiters_.fetch_add(1U, std::memory_order_seq_cst);
-    std::uint8_t mode = blocking_active_.load(std::memory_order_acquire);
-    if (mode < 2U) [[unlikely]] {
-      mode = activate_blocking_once();
+    std::uint8_t mode = 0U;
+    if (s == nullptr) [[unlikely]] {
+      s = get_or_activate_state_slow(slot, mode);
+    } else {
+      mode = s->mode.load(std::memory_order_acquire);
+      if (mode < 2U) [[unlikely]] {
+        s = get_or_activate_state_slow(slot, mode);
+      }
     }
+    const std::uint32_t ep = s->epoch.load(std::memory_order_relaxed);
+    s->waiters.fetch_add(1U, std::memory_order_seq_cst);
     if (!pred()) {
-      park_epoch(ep, mode);
+      park_epoch(s, ep, mode);
     }
-    waiters_.fetch_sub(1U, std::memory_order_seq_cst);
+    s->waiters.fetch_sub(1U, std::memory_order_seq_cst);
   }
 }
 
@@ -92,8 +98,10 @@ template <std::size_t kStripes>
 template <typename StopPred>
 THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
     std::uint64_t ticket, StopPred&& pred) noexcept {
-  ParkStripe& st = stripes_[static_cast<std::size_t>(ticket) & kStripeMask];
-  if (st.waiters.load(std::memory_order_relaxed) == 0U) {
+  const std::size_t stripe_idx = static_cast<std::size_t>(ticket) & kStripeMask;
+  StripedParkState* s = state_.load(std::memory_order_acquire);
+  if (s == nullptr ||
+      s->stripes[stripe_idx].waiters.load(std::memory_order_relaxed) == 0U) {
     THETA_DISABLE_UNROLL
     for (int spin = 0; spin < 20; ++spin) {
       if (pred()) {
@@ -110,13 +118,18 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
     }
   }
   while (!pred()) {
+    std::uint8_t mode = 0U;
+    if (s == nullptr) [[unlikely]] {
+      s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+    } else {
+      mode = s->mode.load(std::memory_order_acquire);
+      if (mode < 2U) [[unlikely]] {
+        s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+      }
+    }
+    ParkStripe& st = s->stripes[stripe_idx];
     const std::uint32_t ep = st.epoch.load(std::memory_order_relaxed);
     st.waiters.fetch_add(1U, std::memory_order_seq_cst);
-    std::uint8_t mode = blocking_active_.load(std::memory_order_acquire);
-    if (mode < 2U) [[unlikely]] {
-      mode = StripedParkLotBase::activate_blocking_once(blocking_active_,
-                                                        activate_lock_);
-    }
     if (!pred()) {
       StripedParkLotBase::park_stripe_epoch(st, ep, mode);
     }
