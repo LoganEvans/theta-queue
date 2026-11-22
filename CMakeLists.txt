@@ -75,10 +75,9 @@ if(BUILD_TESTING)
   gtest_discover_tests(queue_test)
 endif()
 
-if((BUILD_BENCHMARK
-    OR "$ENV{BUILD_BENCHMARK}" STREQUAL "ON"
-    OR "$ENV{BUILD_BENCHMARK}" STREQUAL "true")
-   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/queue_benchmark.cpp")
+if(BUILD_BENCHMARK
+   OR "$ENV{BUILD_BENCHMARK}" STREQUAL "ON"
+   OR "$ENV{BUILD_BENCHMARK}" STREQUAL "true")
   find_package(benchmark REQUIRED)
   find_package(absl QUIET)
   find_package(theta-mutex CONFIG QUIET)
