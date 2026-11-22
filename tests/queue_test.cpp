@@ -2,8 +2,6 @@
 // Copyright (c) 2023-2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
-#include "theta/queue.hpp"
-
 #include <gtest/gtest.h>
 #include <sched.h>
 #include <sys/time.h>
@@ -20,9 +18,13 @@
 #include <random>
 #include <span>
 #include <string>
+#include <theta/queue.hpp>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "queue_odr_helper.hpp"
+#include "queue_test_peer.hpp"
 
 namespace theta {
 namespace {
@@ -219,11 +221,7 @@ using MpmcQueueTypes =
 TYPED_TEST_SUITE(MpmcTryStressTests, MpmcQueueTypes);
 
 TYPED_TEST(MpmcTryStressTests, MultithreadedTryStress) {
-#if THETA_QUEUE_TSAN
-  constexpr uint64_t kPushesPerThread = 10000;
-#else
-  constexpr uint64_t kPushesPerThread = 50000;
-#endif
+  constexpr uint64_t kPushesPerThread = arch::kTsanEnabled ? 10'000 : 50'000;
   constexpr std::size_t kNumThreads = 4;
   std::array<std::thread, kNumThreads> threads;
   std::array<std::atomic<uint64_t>, kNumThreads> sums{};
@@ -275,11 +273,7 @@ TYPED_TEST(MpmcTryStressTests, MultithreadedTryStress) {
 }
 
 TEST(SPSCQueueTest, MultithreadedExactFifoAndBlocking) {
-#if THETA_QUEUE_TSAN
-  constexpr uint64_t kCount = 40'000;
-#else
-  constexpr uint64_t kCount = 200'000;
-#endif
+  constexpr uint64_t kCount = arch::kTsanEnabled ? 40'000 : 200'000;
   SPSCQueue<uint64_t, 64> queue{};
   EXPECT_EQ(queue.capacity(), 63U);
 
@@ -491,11 +485,7 @@ TYPED_TEST(UnboundedBasicTests, ShallowAndDeepBurstFifo) {
 }
 
 TEST(UnboundedQueueTest, USPSC_CrossThreadExactOrderAndBlocking) {
-#if THETA_QUEUE_TSAN
-  constexpr uint64_t kTotal = 40'000;
-#else
-  constexpr uint64_t kTotal = 250'000;
-#endif
+  constexpr uint64_t kTotal = arch::kTsanEnabled ? 40'000 : 250'000;
   USPSCQueue<uint64_t, 5> q;  // 32-item slabs
 
   std::thread cons([&]() {
@@ -516,13 +506,8 @@ TEST(UnboundedQueueTest, USPSC_CrossThreadExactOrderAndBlocking) {
 }
 
 TEST(UnboundedQueueTest, UMPSC_MultiProducerSingleConsumerConservation) {
-#if THETA_QUEUE_TSAN
   constexpr std::size_t kProducers = 4;
-  constexpr uint64_t kPerProducer = 8'000;
-#else
-  constexpr std::size_t kProducers = 4;
-  constexpr uint64_t kPerProducer = 30'000;
-#endif
+  constexpr uint64_t kPerProducer = arch::kTsanEnabled ? 8'000 : 30'000;
   constexpr uint64_t kTotal = kProducers * kPerProducer;
 
   UMPSCQueue<uint64_t, 5> q;
@@ -554,15 +539,9 @@ TEST(UnboundedQueueTest, UMPSC_MultiProducerSingleConsumerConservation) {
 }
 
 TEST(UnboundedQueueTest, UMPMC_MultithreadedExactConservation) {
-#if THETA_QUEUE_TSAN
   constexpr std::size_t kProducers = 4;
   constexpr std::size_t kConsumers = 4;
-  constexpr uint64_t kPerThread = 8'000;
-#else
-  constexpr std::size_t kProducers = 4;
-  constexpr std::size_t kConsumers = 4;
-  constexpr uint64_t kPerThread = 25'000;
-#endif
+  constexpr uint64_t kPerThread = arch::kTsanEnabled ? 8'000 : 25'000;
   constexpr uint64_t kTotal = kProducers * kPerThread;
 
   UMPMCQueue<uint64_t, 5> q;  // 32-slot slabs force rapid slab recycling
@@ -773,13 +752,8 @@ TEST(MPMCQueueTest, PreemptionStormStress) {
 // 2-Tier `rseq` + 7-Slot CAM Overflow & Phase Migration Tests (> 7 Producers)
 // ============================================================================
 TEST(FastRseqQueueTest, Overflow10ProducersAndPhaseMigration) {
-#if THETA_QUEUE_TSAN
   constexpr std::size_t kProducers = 10;
-  constexpr uint64_t kPerProducer = 3'000;
-#else
-  constexpr std::size_t kProducers = 10;
-  constexpr uint64_t kPerProducer = 12'000;
-#endif
+  constexpr uint64_t kPerProducer = arch::kTsanEnabled ? 3'000 : 12'000;
   constexpr uint64_t kTotal = kProducers * kPerProducer;
 
   FastMPSCQueue<uint64_t, 256> mpsc{};
@@ -918,6 +892,34 @@ TEST(BulkAndDrainTest, SPSC_CrossThreadBulkStreamingAndMoveOnlyDrain) {
     EXPECT_EQ(live.load(), 15);
   }
   EXPECT_EQ(live.load(), 0);
+}
+
+TEST(ConventionsAndPeerTest, MultiTuOdrAndTwoTierStateTransitions) {
+  EXPECT_EQ(test_odr::exercise_queues_in_second_tu(100U), 136U);
+
+  SPSCQueue<uint64_t, 16> spsc;
+  EXPECT_EQ(queue::detail::QueueTestPeer::spsc_cons_blocking_mode(spsc), 0U);
+  ASSERT_TRUE(spsc.try_push(7U));
+  EXPECT_EQ(spsc.try_pop(), 7U);
+  EXPECT_EQ(queue::detail::QueueTestPeer::spsc_cons_blocking_mode(spsc), 0U);
+
+  std::thread delayed_prod([&]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    spsc.push(42U);
+  });
+  EXPECT_EQ(spsc.pop(), 42U);
+  delayed_prod.join();
+  EXPECT_GE(queue::detail::QueueTestPeer::spsc_cons_blocking_mode(spsc), 2U);
+
+  FastMPSCQueue<uint64_t, 64> fast_mpsc;
+  ASSERT_TRUE(fast_mpsc.try_push(99U));
+  if constexpr (queue::detail::QueueTestPeer::uses_rseq_lanes<
+                    FastMPSCQueue<uint64_t, 64>>()) {
+    EXPECT_EQ(queue::detail::QueueTestPeer::rseq_prod_biased(fast_mpsc), 1U);
+    EXPECT_EQ(queue::detail::QueueTestPeer::rseq_num_prod(fast_mpsc), 1U);
+    EXPECT_EQ(queue::detail::QueueTestPeer::rseq_overflow_ops(fast_mpsc), 0U);
+  }
+  EXPECT_EQ(fast_mpsc.try_pop(), 99U);
 }
 
 }  // namespace

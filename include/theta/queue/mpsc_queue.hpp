@@ -1,4 +1,4 @@
-// FILENAME: include/theta/queue/mpsc-queue.h
+// FILENAME: include/theta/queue/mpsc_queue.hpp
 // Copyright (c) 2023-2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
@@ -7,16 +7,19 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <climits>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <theta/arch.hpp>
+#include <theta/queue/detail/ring_common.hpp>
+#include <theta/queue/detail/rseq_lane_engine.hpp>
+#include <theta/queue/queue_opts.hpp>
 #include <type_traits>
 #include <utility>
-
-#include "theta/queue/defs.h"
-#include "theta/queue/queue-opts.h"
-#include "theta/queue/rseq-queue.h"
 
 namespace theta {
 
@@ -28,11 +31,12 @@ namespace theta {
 //      near full boundary without speculative `turn` RFO pollution) + zero-RMW
 //      single-consumer `head_` line + bulk `try_push_bulk` / `drain`.
 // 2. `QueueOrder::PerProducer` (`FastMPSCQueue` alias):
-//    - 2-Tier Linux `rseq` + 7-slot SSE2 CPU CAM lanes with zero-RMW sticky
-//      single-consumer draining (`332+ M/s` at `4P+1C`, `45x` Folly).
+//    - 2-Tier Linux `rseq` + 7-slot SIMD CPU CAM lanes with zero-RMW deficit
+//      round-robin single-consumer draining.
 template <QueueElement T, std::size_t kStaticBufferSize = 0,
           QueueOrder kOrder = QueueOrder::StrictFIFO>
 class MPSCQueue {
+  friend struct queue::detail::QueueTestPeer;
   static_assert(kStaticBufferSize == 0 ||
                     (std::has_single_bit(kStaticBufferSize) &&
                      kStaticBufferSize >= 2),
@@ -99,7 +103,7 @@ class MPSCQueue {
         const std::uint64_t pos =
             tail_.fetch_add(1U, std::memory_order_relaxed);
         const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-        const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+        const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
         if (pf_gate_.should_prefetch()) {
           slots_.prefetch_write(phys);
         }
@@ -107,7 +111,7 @@ class MPSCQueue {
         std::uint32_t spin = 0;
         while (slots_.turn(phys).load(std::memory_order_acquire) != expected)
             [[unlikely]] {
-          queue_detail::spin_pause(spin);
+          queue::detail::spin_pause(spin);
         }
         slots_.storage(phys).construct(std::forward<Args>(args)...);
         slots_.turn(phys).store(expected + 1U, std::memory_order_release);
@@ -121,13 +125,11 @@ class MPSCQueue {
       }
     }
 
-    // Near-full boundary `CAS` path: check capacity & win `CAS` BEFORE touching
-    // `slots_.turn(phys)` when `cap >= 256`, avoiding losing-producer RFO
-    // thrash!
+    // Near-full boundary `CAS` path
     std::uint64_t pos = tail_.load(std::memory_order_relaxed);
     for (;;) {
       const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-      const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+      const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
       const std::uint64_t seq =
           slots_.turn(phys).load(std::memory_order_acquire);
       const std::uint64_t expected = (pos >> sh) << 1U;
@@ -223,7 +225,7 @@ class MPSCQueue {
           const std::uint64_t pos = base + i;
           const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
           const std::size_t phys =
-              queue_detail::remap_slot_index(ring_slot, sh);
+              queue::detail::remap_slot_index(ring_slot, sh);
           if (do_pf) {
             slots_.prefetch_write(phys);
           }
@@ -231,7 +233,7 @@ class MPSCQueue {
           std::uint32_t spin = 0;
           while (slots_.turn(phys).load(std::memory_order_acquire) != expected)
               [[unlikely]] {
-            queue_detail::spin_pause(spin);
+            queue::detail::spin_pause(spin);
           }
           slots_.storage(phys).construct(*first);
           slots_.turn(phys).store(expected + 1U, std::memory_order_release);
@@ -257,7 +259,7 @@ class MPSCQueue {
     const std::size_t sh = buf_shift();
     const std::uint64_t pos = tail_.fetch_add(1U, std::memory_order_relaxed);
     const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-    const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+    const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
     if (pf_gate_.should_prefetch()) {
       slots_.prefetch_write(phys);
     }
@@ -281,14 +283,12 @@ class MPSCQueue {
 
   void push(T&& val) noexcept { emplace(std::move(val)); }
 
-  // Single-consumer `try_pop`: reads/advances `head_` with plain load/store
-  // (zero `CAS` contention against producers!).
   std::optional<T> try_pop() noexcept {
     const std::size_t m = buf_mask();
     const std::size_t sh = buf_shift();
     const std::uint64_t pos = head_.load(std::memory_order_relaxed);
     const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-    const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+    const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
     const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected) {
       return std::nullopt;
@@ -305,7 +305,7 @@ class MPSCQueue {
     const std::size_t sh = buf_shift();
     const std::uint64_t pos = head_.load(std::memory_order_relaxed);
     const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-    const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+    const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
     const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected) {
       return false;
@@ -329,7 +329,6 @@ class MPSCQueue {
         max_count);
   }
 
-  // Zero-copy single-consumer drain: batches `head_` release updates!
   template <typename Func>
   std::size_t drain(Func&& fn, std::size_t max_count = SIZE_MAX) noexcept(
       std::is_nothrow_invocable_v<Func&, T&&>) {
@@ -344,13 +343,13 @@ class MPSCQueue {
     for (; consumed < max_count; ++consumed) {
       const std::uint64_t pos = start_pos + consumed;
       const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-      const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+      const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
       const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
       if (slots_.turn(phys).load(std::memory_order_acquire) != expected) {
         break;
       }
       T* p = slots_.storage(phys).ptr();
-      const bool cont = queue_detail::invoke_drain_visitor(fn, std::move(*p));
+      const bool cont = queue::detail::invoke_drain_visitor(fn, std::move(*p));
       std::destroy_at(p);
       slots_.turn(phys).store(expected + 1U, std::memory_order_release);
       if (!cont) {
@@ -370,7 +369,7 @@ class MPSCQueue {
     const std::size_t sh = buf_shift();
     const std::uint64_t pos = head_.load(std::memory_order_relaxed);
     const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
-    const std::size_t phys = queue_detail::remap_slot_index(ring_slot, sh);
+    const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
     const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
         [[unlikely]] {
@@ -411,7 +410,7 @@ class MPSCQueue {
   }
 
  private:
-  [[nodiscard]] THETA_QUEUE_FORCE_INLINE constexpr std::size_t buf_mask()
+  [[nodiscard]] THETA_FORCE_INLINE constexpr std::size_t buf_mask()
       const noexcept {
     if constexpr (kStaticBufferSize != 0) {
       return kStaticBufferSize - 1U;
@@ -420,7 +419,7 @@ class MPSCQueue {
     }
   }
 
-  [[nodiscard]] THETA_QUEUE_FORCE_INLINE constexpr std::size_t buf_shift()
+  [[nodiscard]] THETA_FORCE_INLINE constexpr std::size_t buf_shift()
       const noexcept {
     if constexpr (kStaticBufferSize != 0) {
       return static_cast<std::size_t>(std::countr_zero(kStaticBufferSize));
@@ -429,7 +428,7 @@ class MPSCQueue {
     }
   }
 
-  [[nodiscard]] THETA_QUEUE_FORCE_INLINE constexpr std::uint64_t faa_limit()
+  [[nodiscard]] THETA_FORCE_INLINE constexpr std::uint64_t faa_limit()
       const noexcept {
     if constexpr (kStaticBufferSize != 0) {
       return kStaticBufferSize - resolve_faa_margin(kStaticBufferSize);
@@ -442,9 +441,9 @@ class MPSCQueue {
   const std::size_t mask_;
   const std::size_t shift_;
   const std::uint64_t faa_limit_;
-  queue_detail::TurnSlotArray<T> slots_;
+  queue::detail::TurnSlotArray<T> slots_;
 
-  queue_detail::ContentionPrefetchGate pf_gate_;
+  queue::detail::ContentionPrefetchGate pf_gate_;
 
   alignas(
       kHardwareDestructiveInterferenceSize) std::atomic<std::uint64_t> tail_{0};
@@ -453,17 +452,17 @@ class MPSCQueue {
   alignas(
       kHardwareDestructiveInterferenceSize) std::atomic<std::uint64_t> head_{0};
 
-  queue_detail::StripedParkLot<16> prod_park_;
-  queue_detail::AsymmetricParkLot cons_park_;
+  queue::detail::StripedParkLot<16> prod_park_;
+  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 // Specialization for `QueueOrder::PerProducer`: 2-Tier `rseq` + 7-slot SIMD CAM
 template <QueueElement T, std::size_t kStaticBufferSize>
 class MPSCQueue<T, kStaticBufferSize, QueueOrder::PerProducer>
-    : public queue_detail::RseqLaneEngine<
+    : public queue::detail::RseqLaneEngine<
           T, kStaticBufferSize, /*kMultiConsumer=*/false,
           MPSCQueue<T, kStaticBufferSize, QueueOrder::StrictFIFO>> {
-  using Base = queue_detail::RseqLaneEngine<
+  using Base = queue::detail::RseqLaneEngine<
       T, kStaticBufferSize, /*kMultiConsumer=*/false,
       MPSCQueue<T, kStaticBufferSize, QueueOrder::StrictFIFO>>;
 

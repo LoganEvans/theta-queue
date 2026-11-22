@@ -1,0 +1,12 @@
+# FILENAME: cmake/theta-queue-deps.cmake.in
+
+find_dependency(Threads)
+
+if("@THETA_QUEUE_HAS_THETA_CMAKE@" STREQUAL "ON" AND NOT TARGET
+                                                     theta::theta-cmake)
+  find_dependency(theta-cmake CONFIG HINTS "@THETA_CMAKE_CONFIG_DIR@")
+endif()
+
+if(TARGET theta::theta-queue AND NOT TARGET theta::queue)
+  add_library(theta::queue ALIAS theta::theta-queue)
+endif()

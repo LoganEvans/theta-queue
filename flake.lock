@@ -43,7 +43,6 @@
           "theta-utils",
           "nixpkgs"
         ],
-        "theta-mutex": "theta-mutex",
         "theta-utils": "theta-utils",
         "treefmt-nix": [
           "theta-utils",
@@ -66,39 +65,6 @@
         "type": "github"
       }
     },
-    "theta-mutex": {
-      "inputs": {
-        "flake-utils": [
-          "theta-mutex",
-          "theta-utils",
-          "flake-utils"
-        ],
-        "nixpkgs": [
-          "theta-mutex",
-          "theta-utils",
-          "nixpkgs"
-        ],
-        "theta-utils": [
-          "theta-utils"
-        ],
-        "treefmt-nix": [
-          "theta-mutex",
-          "theta-utils",
-          "treefmt-nix"
-        ]
-      },
-      "locked": {
-        "lastModified": 1795037247,
-        "narHash": "sha256-hg7bi7JV0kFOrK0nVzahi9Lj7gSR7jOq9+q4irgvYiI=",
-        "path": "/home/logan/theta/theta-mutex",
-        "type": "path"
-      },
-      "original": {
-        "owner": "LoganEvans",
-        "repo": "theta-mutex",
-        "type": "github"
-      }
-    },
     "theta-utils": {
       "inputs": {
         "flake-utils": "flake-utils",
@@ -106,10 +72,12 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1795037039,
-        "narHash": "sha256-Ah6XCxZc53aLohnEfFvTNKBH6lfWpWbDGU13R8D13ds=",
-        "path": "/home/logan/theta/theta-utils",
-        "type": "path"
+        "lastModified": 1795326146,
+        "narHash": "sha256-T7NC/VQr2TZ6FYapCNgnpUQgArc8x0T5FQjTBsf+lQk=",
+        "owner": "LoganEvans",
+        "repo": "theta-utils",
+        "rev": "43c9e6396c663b3657153e87fba95d7478ecaa9d",
+        "type": "github"
       },
       "original": {
         "owner": "LoganEvans",

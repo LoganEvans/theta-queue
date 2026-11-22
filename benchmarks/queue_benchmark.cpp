@@ -5,9 +5,6 @@
 #include <benchmark/benchmark.h>
 #include <pthread.h>
 #include <sched.h>
-#if defined(__x86_64__)
-#include <immintrin.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -21,11 +18,11 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <theta/arch.hpp>
+#include <theta/queue.hpp>
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include "theta/queue.hpp"
 
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 #include <atomic_queue/atomic_queue.h>
@@ -68,15 +65,7 @@ namespace {
 constexpr std::size_t kBenchQueueCapacity = 1024;
 constexpr std::size_t kBatchPerProducer = 8192;
 
-inline void cpu_relax() noexcept {
-#if defined(__x86_64__)
-  _mm_pause();
-#elif defined(__aarch64__)
-  asm volatile("yield" ::: "memory");
-#else
-  std::this_thread::yield();
-#endif
-}
+inline void cpu_relax() noexcept { ::theta::arch::cpu_relax(); }
 
 // Orders logical CPUs cleanly for hybrid + SMT x86-64 CPUs:
 //   1. Primary threads of SMT P-cores

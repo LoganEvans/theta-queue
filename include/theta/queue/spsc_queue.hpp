@@ -1,4 +1,4 @@
-// FILENAME: include/theta/queue/spsc-queue.h
+// FILENAME: include/theta/queue/spsc_queue.hpp
 // Copyright (c) 2023-2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
@@ -7,16 +7,19 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <climits>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
+#include <theta/arch.hpp>
+#include <theta/queue/detail/ring_common.hpp>
+#include <theta/queue/queue_opts.hpp>
 #include <type_traits>
 #include <utility>
-
-#include "theta/queue/defs.h"
-#include "theta/queue/queue-opts.h"
 
 namespace theta {
 
@@ -24,7 +27,7 @@ namespace theta {
 // Uses pre-wrapped [0 .. N-1] indices (capacity N - 1) so array accesses avoid
 // masking instructions, linear slot layout for L1D write-combining,
 // 128B-isolated producer/consumer cache lines with local head/tail shadows,
-// frameless `asm volatile goto` asymmetric futex wakeup, and zero-copy bulk
+// frameless 2-tier asymmetric futex wakeup, and zero-copy bulk
 // `try_push_bulk` / `try_pop_bulk` / `drain` (`Flusher`) operations.
 template <QueueElement T, std::size_t kStaticBufferSize = 0>
 class SPSCQueue {
@@ -33,7 +36,8 @@ class SPSCQueue {
                      kStaticBufferSize >= 2),
                 "kStaticBufferSize must be 0 (dynamic) or a power of 2 >= 2");
 
-  using Slot = queue_detail::RawSlotStorage<T>;
+  friend struct queue::detail::QueueTestPeer;
+  using Slot = queue::detail::RawSlotStorage<T>;
 
   static constexpr std::size_t resolve_ring_len(
       const QueueOpts& opts) noexcept {
@@ -54,7 +58,8 @@ class SPSCQueue {
   explicit SPSCQueue(const QueueOpts& opts = QueueOpts{})
       : mask_(resolve_ring_len(opts) - 1U),
         slots_(
-            queue_detail::aligned_alloc_uninit<Slot>(resolve_ring_len(opts))) {}
+            queue::detail::aligned_alloc_uninit<Slot>(resolve_ring_len(opts))) {
+  }
 
   ~SPSCQueue() {
     std::size_t h = head_.load(std::memory_order_relaxed);
@@ -64,7 +69,7 @@ class SPSCQueue {
       slots_[h].destroy();
       h = (h + 1U) & m;
     }
-    queue_detail::aligned_free_uninit(slots_);
+    queue::detail::aligned_free_uninit(slots_);
   }
 
   SPSCQueue(const SPSCQueue&) = delete;
@@ -99,9 +104,6 @@ class SPSCQueue {
 
   bool try_push(T&& val) noexcept { return try_emplace(std::move(val)); }
 
-  // Contiguous batch push: amortizes `head_` check, `tail_` release store, and
-  // `cons_park_` check across up to `items.size()` elements (`std::memcpy` for
-  // trivially copyable `T`).
   std::size_t try_push_bulk(std::span<const T> items) noexcept(
       std::is_nothrow_copy_constructible_v<T>)
     requires std::copy_constructible<T>
@@ -250,10 +252,6 @@ class SPSCQueue {
     return n;
   }
 
-  // Zero-copy consumer drain (`Flusher`): visits up to `max_count` elements
-  // directly in-place inside the ring before committing a single `head_` store.
-  // If `fn(T&&)` returns `bool`, returning `false` stops draining after the
-  // current element.
   template <typename Func>
   std::size_t drain(Func&& fn, std::size_t max_count = SIZE_MAX) noexcept(
       std::is_nothrow_invocable_v<Func&, T&&>) {
@@ -290,7 +288,7 @@ class SPSCQueue {
     for (; consumed < limit; ++consumed) {
       Slot& slot = slots_[(h + consumed) & m];
       T* p = slot.ptr();
-      const bool cont = queue_detail::invoke_drain_visitor(fn, std::move(*p));
+      const bool cont = queue::detail::invoke_drain_visitor(fn, std::move(*p));
       std::destroy_at(p);
       if (!cont) {
         ++consumed;
@@ -335,7 +333,7 @@ class SPSCQueue {
   [[nodiscard]] std::size_t capacity() const noexcept { return ring_mask(); }
 
  private:
-  [[nodiscard]] THETA_QUEUE_FORCE_INLINE constexpr std::size_t ring_mask()
+  [[nodiscard]] THETA_FORCE_INLINE constexpr std::size_t ring_mask()
       const noexcept {
     if constexpr (kStaticBufferSize != 0) {
       return kStaticBufferSize - 1U;
@@ -355,8 +353,8 @@ class SPSCQueue {
       0};
   std::size_t tail_cache_{0};
 
-  queue_detail::AsymmetricParkLot prod_park_;
-  queue_detail::AsymmetricParkLot cons_park_;
+  queue::detail::AsymmetricParkLot prod_park_;
+  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 }  // namespace theta

@@ -12,7 +12,6 @@
   gtest,
   linuxHeaders,
   theta-cmake ? null,
-  theta-mutex ? null,
   src,
 }:
 llvmPackages_23.stdenv.mkDerivation {
@@ -31,15 +30,15 @@ llvmPackages_23.stdenv.mkDerivation {
     glog
     gtest
     linuxHeaders
-  ]
-  ++ builtins.filter (x: x != null) [ theta-mutex ];
+  ];
+
+  propagatedBuildInputs = builtins.filter (x: x != null) [ theta-cmake ];
 
   nativeBuildInputs = [
     cmake
     pkg-config
     llvmPackages_23.clang-tools
-  ]
-  ++ builtins.filter (x: x != null) [ theta-cmake ];
+  ];
 
   dontStrip = true;
   cmakeBuildType = "Release";

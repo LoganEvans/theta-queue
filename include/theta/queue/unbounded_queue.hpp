@@ -1,4 +1,4 @@
-// FILENAME: include/theta/queue/unbounded-queue.h
+// FILENAME: include/theta/queue/unbounded_queue.hpp
 // Copyright (c) 2023-2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
@@ -7,16 +7,19 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
+#include <theta/arch.hpp>
+#include <theta/queue/detail/ring_common.hpp>
+#include <theta/queue/queue_opts.hpp>
 #include <type_traits>
 #include <utility>
-
-#include "theta/queue/defs.h"
 
 namespace theta {
 
@@ -45,10 +48,10 @@ class UnboundedQueue<T, true, true, kLgSlab> {
 
   static constexpr std::size_t kSlabCap = std::size_t{1} << kLgSlab;
   static constexpr std::size_t kMask = kSlabCap - 1U;
-  using Slot = queue_detail::RawSlotStorage<T>;
+  using Slot = queue::detail::RawSlotStorage<T>;
 
   // 128B separation between `write_pos`/`next` header and `data[0]` prevents
-  // Intel L2 adjacent-line spatial prefetcher false sharing (`+5x` streaming!).
+  // Intel L2 adjacent-line spatial prefetcher false sharing.
   struct alignas(kHardwareDestructiveInterferenceSize) Slab {
     alignas(kHardwareDestructiveInterferenceSize)
         std::atomic<std::uint64_t> write_pos{0};
@@ -59,7 +62,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
   };
 
   static Slab* alloc_slab() {
-    Slab* raw = queue_detail::aligned_alloc_uninit<Slab>(1U);
+    Slab* raw = queue::detail::aligned_alloc_uninit<Slab>(1U);
     std::construct_at(&raw->write_pos, std::uint64_t{0});
     std::construct_at(&raw->next, nullptr);
     raw->free_next = nullptr;
@@ -67,7 +70,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
   }
 
   static void free_slab(Slab* s) noexcept {
-    queue_detail::aligned_free_uninit(s);
+    queue::detail::aligned_free_uninit(s);
   }
 
  public:
@@ -235,7 +238,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
               cons_slab_->data[static_cast<std::size_t>(r + consumed) & kMask];
           T* p = slot.ptr();
           const bool cont =
-              queue_detail::invoke_drain_visitor(fn, std::move(*p));
+              queue::detail::invoke_drain_visitor(fn, std::move(*p));
           std::destroy_at(p);
           if (!cont) {
             ++consumed;
@@ -260,7 +263,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
         break;
       }
       ++total;
-      if (!queue_detail::invoke_drain_visitor(fn, std::move(*slow))) {
+      if (!queue::detail::invoke_drain_visitor(fn, std::move(*slow))) {
         break;
       }
     }
@@ -302,7 +305,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
 
  private:
   template <typename... Args>
-  THETA_QUEUE_ALIGNED_COLD void emplace_slow(
+  THETA_ALIGNED_NOINLINE void emplace_slow(
       Slab* s, std::uint64_t w,
       Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args...>) {
     if (s == active_cons_slab_.load(std::memory_order_acquire)) {
@@ -329,7 +332,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
     cons_park_.notify_if_waiters();
   }
 
-  THETA_QUEUE_ALIGNED_COLD std::optional<T> pop_slow_opt(
+  THETA_ALIGNED_NOINLINE std::optional<T> pop_slow_opt(
       std::uint64_t r) noexcept {
     Slab* s = cons_slab_;
     std::uint64_t w = s->write_pos.load(std::memory_order_acquire);
@@ -415,7 +418,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
   std::atomic<Slab*> active_cons_slab_{nullptr};
   alignas(kHardwareDestructiveInterferenceSize) std::atomic<Slab*> free_head_{
       nullptr};
-  queue_detail::AsymmetricParkLot cons_park_;
+  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 // ============================================================================
@@ -423,7 +426,7 @@ class UnboundedQueue<T, true, true, kLgSlab> {
 //   - Type-stable pooled elastic slabs (zero Hazard Pointers on push/pop)
 //   - Hybrid fused/separated `{turn, T}` storage + 128B page-local bounce
 //   - Single-consumer specialization (`kSingleConsumer == true`) elides
-//     consumer `CAS` and `consumed` RMWs on `try_pop`!
+//     consumer `CAS` and `consumed` RMWs on `try_pop`.
 // ============================================================================
 template <QueueElement T, bool kSingleProducer, bool kSingleConsumer,
           std::size_t kLgSlab>
@@ -448,7 +451,7 @@ class UnboundedQueue {
     std::atomic<std::uint32_t> retire_state{0};
     Slab* pool_next{nullptr};
     Slab* all_next{nullptr};
-    queue_detail::TurnSlotArray<T> slots;
+    queue::detail::TurnSlotArray<T> slots;
 
     explicit Slab(std::uint64_t id) : slab_id(id), slots(kSlabCap) {}
   };
@@ -491,7 +494,7 @@ class UnboundedQueue {
     if (s->slab_id.load(std::memory_order_acquire) != want_id) [[unlikely]] {
       s = find_or_create_slab(s, want_id);
     }
-    const std::size_t phys = queue_detail::remap_slot_index(
+    const std::size_t phys = queue::detail::remap_slot_index(
         static_cast<std::size_t>(t) & kMask, kLgSlab);
     if (pf_gate_.should_prefetch()) {
       s->slots.prefetch_write(phys);
@@ -549,7 +552,7 @@ class UnboundedQueue {
       if (s->slab_id.load(std::memory_order_acquire) != want_id) [[unlikely]] {
         s = find_or_create_slab(s, want_id);
       }
-      const std::size_t phys = queue_detail::remap_slot_index(
+      const std::size_t phys = queue::detail::remap_slot_index(
           static_cast<std::size_t>(t) & kMask, kLgSlab);
       if (do_pf) {
         s->slots.prefetch_write(phys);
@@ -603,7 +606,7 @@ class UnboundedQueue {
         break;
       }
       ++count;
-      if (!queue_detail::invoke_drain_visitor(fn, std::move(*item))) {
+      if (!queue::detail::invoke_drain_visitor(fn, std::move(*item))) {
         break;
       }
     }
@@ -640,21 +643,20 @@ class UnboundedQueue {
   [[nodiscard]] bool empty() const noexcept { return size() == 0U; }
 
  private:
-  static THETA_QUEUE_FORCE_INLINE std::uint64_t fetch_inc_sp(
+  static THETA_FORCE_INLINE std::uint64_t fetch_inc_sp(
       std::atomic<std::uint64_t>& v) noexcept {
     const std::uint64_t cur = v.load(std::memory_order_relaxed);
     v.store(cur + 1U, std::memory_order_release);
     return cur;
   }
 
-  static THETA_QUEUE_FORCE_INLINE std::uint64_t fetch_add_sp(
+  static THETA_FORCE_INLINE std::uint64_t fetch_add_sp(
       std::atomic<std::uint64_t>& v, std::size_t n) noexcept {
     const std::uint64_t cur = v.load(std::memory_order_relaxed);
     v.store(cur + n, std::memory_order_release);
     return cur;
   }
 
-  // Fast non-RMW single-consumer path (`UMPSCQueue` / `USPMC` fallback)
   std::optional<T> try_pop_sc() noexcept {
     const std::uint64_t c = head_.load(std::memory_order_relaxed);
     const std::uint64_t want_id = c >> kLgSlab;
@@ -665,7 +667,7 @@ class UnboundedQueue {
         return std::nullopt;
       }
     }
-    const std::size_t phys = queue_detail::remap_slot_index(
+    const std::size_t phys = queue::detail::remap_slot_index(
         static_cast<std::size_t>(c) & kMask, kLgSlab);
     if (s->slots.turn(phys).load(std::memory_order_acquire) != c + 1U) {
       return std::nullopt;
@@ -694,7 +696,7 @@ class UnboundedQueue {
           return std::nullopt;
         }
       }
-      const std::size_t phys = queue_detail::remap_slot_index(
+      const std::size_t phys = queue::detail::remap_slot_index(
           static_cast<std::size_t>(c) & kMask, kLgSlab);
       const std::uint64_t ready_tag =
           s->slots.turn(phys).load(std::memory_order_acquire);
@@ -722,8 +724,8 @@ class UnboundedQueue {
     }
   }
 
-  THETA_QUEUE_ALIGNED_COLD Slab* find_or_create_slab(Slab* s,
-                                                     std::uint64_t want_id) {
+  THETA_ALIGNED_NOINLINE Slab* find_or_create_slab(Slab* s,
+                                                   std::uint64_t want_id) {
     for (;;) {
       const std::uint64_t cur_id = s->slab_id.load(std::memory_order_acquire);
       if (cur_id == want_id) {
@@ -755,8 +757,8 @@ class UnboundedQueue {
     }
   }
 
-  THETA_QUEUE_ALIGNED_COLD void advance_tail_slab(Slab* s,
-                                                  std::uint64_t next_id) {
+  THETA_ALIGNED_NOINLINE void advance_tail_slab(Slab* s,
+                                                std::uint64_t next_id) {
     if (next_id <= latest_tail_id_.load(std::memory_order_acquire)) {
       return;
     }
@@ -802,14 +804,14 @@ class UnboundedQueue {
     if (next_id <= latest_tail_id_.load(std::memory_order_acquire)) {
       return;
     }
-    const queue_detail::ColdSpinGuard g(pool_lock_);
+    const queue::detail::ColdSpinGuard g(pool_lock_);
     if (next_id > latest_tail_id_.load(std::memory_order_relaxed)) {
       tail_slab_.store(nxt, std::memory_order_release);
       latest_tail_id_.store(next_id, std::memory_order_release);
     }
   }
 
-  [[nodiscard]] THETA_QUEUE_ALIGNED_COLD Slab* find_existing_slab(
+  [[nodiscard]] THETA_ALIGNED_NOINLINE Slab* find_existing_slab(
       std::uint64_t want_id) const noexcept {
     Slab* s = head_slab_.load(std::memory_order_acquire);
     while (s != nullptr) {
@@ -829,8 +831,7 @@ class UnboundedQueue {
     return nullptr;
   }
 
-  THETA_QUEUE_ALIGNED_COLD void retire_full_slab(Slab* s,
-                                                 std::uint64_t slab_id) {
+  THETA_ALIGNED_NOINLINE void retire_full_slab(Slab* s, std::uint64_t slab_id) {
     const std::uint32_t prev =
         s->retire_state.fetch_or(kFlagAllConsumed, std::memory_order_acq_rel);
     if ((prev | kFlagAllConsumed) != kFlagReadyToRecycle) {
@@ -865,7 +866,7 @@ class UnboundedQueue {
 
   Slab* pop_or_alloc_slab(std::uint64_t new_id) {
     {
-      const queue_detail::ColdSpinGuard g(pool_lock_);
+      const queue::detail::ColdSpinGuard g(pool_lock_);
       if (pool_count_ > 2U && pool_head_ != nullptr) {
         Slab* s = pool_head_;
         pool_head_ = s->pool_next;
@@ -884,7 +885,7 @@ class UnboundedQueue {
   }
 
   void push_pool(Slab* s) noexcept {
-    const queue_detail::ColdSpinGuard g(pool_lock_);
+    const queue::detail::ColdSpinGuard g(pool_lock_);
     s->pool_next = nullptr;
     if (pool_tail_ != nullptr) {
       pool_tail_->pool_next = s;
@@ -895,7 +896,7 @@ class UnboundedQueue {
     ++pool_count_;
   }
 
-  queue_detail::ContentionPrefetchGate pf_gate_;
+  queue::detail::ContentionPrefetchGate pf_gate_;
 
   alignas(kHardwareDestructiveInterferenceSize) std::atomic<Slab*> head_slab_{
       nullptr};
@@ -906,14 +907,14 @@ class UnboundedQueue {
   std::atomic<std::uint64_t> tail_{0};
   std::atomic<std::uint64_t> latest_tail_id_{0};
 
-  alignas(kHardwareDestructiveInterferenceSize)
-      queue_detail::ColdSpinLock pool_lock_;
-  Slab* pool_head_{nullptr};
-  Slab* pool_tail_{nullptr};
-  std::size_t pool_count_{0};
+  alignas(kHardwareDestructiveInterferenceSize) queue::detail::ColdSpinLock
+      pool_lock_;
+  Slab* pool_head_ THETA_QUEUE_GUARDED_BY(pool_lock_){nullptr};
+  Slab* pool_tail_ THETA_QUEUE_GUARDED_BY(pool_lock_){nullptr};
+  std::size_t pool_count_ THETA_QUEUE_GUARDED_BY(pool_lock_){0};
   std::atomic<Slab*> all_slabs_{nullptr};
 
-  queue_detail::AsymmetricParkLot cons_park_;
+  queue::detail::AsymmetricParkLot cons_park_;
 };
 
 template <QueueElement T, std::size_t kLgSlab = 9>

@@ -4,10 +4,8 @@
 
 #pragma once
 
-#include "theta/queue/defs.h"
-#include "theta/queue/mpmc-queue.h"
-#include "theta/queue/mpsc-queue.h"
-#include "theta/queue/queue-opts.h"
-#include "theta/queue/rseq-queue.h"
-#include "theta/queue/spsc-queue.h"
-#include "theta/queue/unbounded-queue.h"
+#include <theta/queue/mpmc_queue.hpp>
+#include <theta/queue/mpsc_queue.hpp>
+#include <theta/queue/queue_opts.hpp>
+#include <theta/queue/spsc_queue.hpp>
+#include <theta/queue/unbounded_queue.hpp>
