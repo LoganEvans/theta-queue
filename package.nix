@@ -1,51 +1,45 @@
+# FILENAME: package.nix
 {
-  clangStdenv,
+  llvmPackages_23,
   cmake,
+  pkg-config,
+  abseil-cpp,
+  boost,
   fmt,
+  folly,
   gbenchmark,
   glog,
   gtest,
-  librseq,
-  pkgconf,
+  linuxHeaders,
+  theta-cmake ? null,
+  theta-mutex ? null,
   src,
-  theta-debug-utils,
-  readerwriterqueue,
-  linuxPackages,
-  flamegraph,
-  fetchFromGitHub,
 }:
-let
-  concurrentqueue = fetchFromGitHub {
-    owner = "cameron314";
-    repo = "concurrentqueue";
-    tag = "v1.0.4";
-    hash = "sha256-MkhlDme6ZwKPuRINhfpv7cxliI2GU3RmTfC6O0ke/IQ=";
-  };
-in
-clangStdenv.mkDerivation rec {
+llvmPackages_23.stdenv.mkDerivation {
   inherit src;
-  name = "queue";
+  pname = "theta-queue";
+  version = "0.1.0";
 
-  outputs = [
-    "out"
-  ];
+  outputs = [ "out" ];
 
-  cq = concurrentqueue;
   buildInputs = [
+    abseil-cpp
+    boost
     fmt
+    folly
     gbenchmark
     glog
     gtest
-    theta-debug-utils
-    concurrentqueue
-  ];
+    linuxHeaders
+  ]
+  ++ builtins.filter (x: x != null) [ theta-mutex ];
 
   nativeBuildInputs = [
     cmake
-    pkgconf
-    linuxPackages.perf
-    flamegraph
-  ];
+    pkg-config
+    llvmPackages_23.clang-tools
+  ]
+  ++ builtins.filter (x: x != null) [ theta-cmake ];
 
   dontStrip = true;
   cmakeBuildType = "Release";
@@ -53,6 +47,6 @@ clangStdenv.mkDerivation rec {
 
   doCheck = false;
   env = {
-    BUILD_BENCHMARK = false;
+    BUILD_BENCHMARK = "OFF";
   };
 }

@@ -1,67 +1,66 @@
+# FILENAME: flake.nix
 {
+  description = "theta-queue: Lock-free MPMC and MPSC concurrent queues";
+
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs";
-    flake-utils.url = "github:numtide/flake-utils";
+    theta-utils.url = "github:LoganEvans/theta-utils";
+    nixpkgs.follows = "theta-utils/nixpkgs";
+    flake-utils.follows = "theta-utils/flake-utils";
+    treefmt-nix.follows = "theta-utils/treefmt-nix";
 
-    treefmt-nix.url = "github:numtide/treefmt-nix";
-    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
-
-    theta-debug-utils = {
-      url = "github:LoganEvans/debug-utils";
-      inputs = {
-        flake-utils.follows = "flake-utils";
-        nixpkgs.follows = "nixpkgs";
-        treefmt-nix.follows = "treefmt-nix";
-      };
+    theta-mutex = {
+      url = "github:LoganEvans/theta-mutex";
+      inputs.theta-utils.follows = "theta-utils";
     };
   };
 
   outputs =
     {
       self,
-      nixpkgs,
-      flake-utils,
-      treefmt-nix,
-      theta-debug-utils,
+      theta-utils,
+      theta-mutex,
+      ...
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          config.allowUnfree = true;
-        };
+    let
+      base = theta-utils.lib.mkThetaFlake {
+        inherit self;
+        pname = "theta-queue";
+        packageFn = ./package.nix;
+        treefmtModule = ./treefmt.nix;
+      };
 
-        pkg-theta-debug-utils = theta-debug-utils.packages.${system}.default;
+      injectThetaMutex =
+        system: drv:
+        drv.overrideAttrs (oldAttrs: {
+          buildInputs = (oldAttrs.buildInputs or [ ]) ++ [
+            theta-mutex.packages.${system}.default
+          ];
+        });
+    in
+    base
+    // {
+      packages = builtins.mapAttrs (
+        system: pkgsSet:
+        pkgsSet
+        // {
+          theta-queue = injectThetaMutex system pkgsSet.theta-queue;
+          default = injectThetaMutex system pkgsSet.default;
+          test = injectThetaMutex system pkgsSet.test;
+          benchmark = injectThetaMutex system pkgsSet.benchmark;
+          benchmark-lto = injectThetaMutex system pkgsSet.benchmark-lto;
+        }
+      ) base.packages;
 
-        treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
+      devShells = builtins.mapAttrs (system: shells: {
+        default = injectThetaMutex system shells.default;
+      }) base.devShells;
 
-        drv = pkgs.callPackage ./package.nix {
-          src = self;
-          theta-debug-utils = pkg-theta-debug-utils;
-        };
-      in
-      {
-        packages = rec {
-          queue = drv;
-
-          benchmark = drv.overrideAttrs (old-attrs: {
-            doCheck = true;
-            env.BUILD_BENCHMARK = true;
-          });
-
-          default = queue;
-        };
-
-        devShells = {
-          default = drv.overrideAttrs (old-attrs: {
-            cmakeBuildType = "Debug";
-            doCheck = true;
-            env.BUILD_BENCHMARK = true;
-          });
-        };
-
-        formatter = (pkgs: treefmtEval.config.build.wrapper) { };
-      }
-    );
+      checks = builtins.mapAttrs (
+        system: chkSet:
+        chkSet
+        // {
+          test = injectThetaMutex system chkSet.test;
+        }
+      ) base.checks;
+    };
 }
