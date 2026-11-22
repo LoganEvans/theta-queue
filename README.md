@@ -12,10 +12,10 @@ Include `<theta/queue.hpp>` (or individual headers under `<theta/queue/*.hpp>`):
 - **`theta::SPSCQueue<T, kStaticBufferSize = 0>`** (`<theta/queue/spsc_queue.hpp>`):
   Pre-wrapped `[0 .. N-1]` index ring (`capacity() == N - 1`), linear slot layout for L1D write-combining, 128B-isolated producer/consumer cache lines with local head/tail shadows, frameless 2-tier asymmetric wakeup, and bulk `try_push_bulk` / `try_pop_bulk` / zero-copy `drain`.
 - **`theta::MPSCQueue<T, kStaticBufferSize = 0, kOrder = QueueOrder::StrictFIFO>`** (`<theta/queue/mpsc_queue.hpp>`):
-  - `QueueOrder::StrictFIFO`: `HybridFaaRing` wait-free `LOCK XADD` interior fast path + exact boundary `CAS`, 128B page-local slot bouncing, contention-gated `PREFETCHW`, and zero-RMW consumer `head_`.
+  - `QueueOrder::StrictFIFO`: Wait-free `LOCK XADD` blocking `push()`, strictly lock-free Vyukov `CAS` `try_push()` (with up to 64-slot single-`CAS` batching in `try_push_bulk()`), 128B page-local slot bouncing, contention-gated `PREFETCHW`, and zero-RMW consumer `head_`.
   - **`theta::FastMPSCQueue<T, kStaticBufferSize = 0>`** (`QueueOrder::PerProducer`): 2-Tier Linux `rseq` + 7-slot SIMD CPU CAM lanes with deficit round-robin (`kRseqScQuantum = 64`) single-consumer draining and automatic `MEMBARRIER_RSEQ` CPU-migration recovery.
 - **`theta::MPMCQueue<T, kStaticBufferSize = 0, kOrder = QueueOrder::StrictFIFO>`** (`<theta/queue/mpmc_queue.hpp>`):
-  - `QueueOrder::StrictFIFO`: `HybridFaaRing` bounded MPMC ring with hybrid fused/separated `{turn, T}` storage, 128B page-local slot bouncing, `stlf_micro_pause` SMT-friendly backoff, and 16-way ticket-striped `StripedParkLot` (`MEMBARRIER_CMD_PRIVATE_EXPEDITED`).
+  - `QueueOrder::StrictFIFO`: Wait-free `LOCK XADD` blocking `push()`/`pop()`, strictly lock-free Vyukov `CAS` `try_push()`/`try_pop()` (plus up to 64-slot single-`CAS` batching in `try_push_bulk()`/`try_pop_bulk()`), hybrid fused/separated `{turn, T}` storage, 128B page-local slot bouncing, `stlf_micro_pause` SMT-friendly backoff, and 16-way ticket-striped `StripedParkLot` (`MEMBARRIER_CMD_PRIVATE_EXPEDITED`).
   - **`theta::FastMPMCQueue<T, kStaticBufferSize = 0>`** (`QueueOrder::PerProducer`): Dual 2-Tier Linux `rseq` + 7-slot SIMD CPU CAM lanes with one-shot consumer work-stealing promotion.
 
 ### Unbounded Queues (`ElasticSlab`)

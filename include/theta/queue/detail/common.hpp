@@ -159,8 +159,8 @@ struct StripedParkLotBase {
   [[gnu::cold]] static void notify_ticket_active_slow(
       ParkStripe& stripe) noexcept;
   [[gnu::cold]] static void notify_range_active_slow(
-      ParkStripe* stripes, std::size_t stripe_mask, std::uint64_t base_ticket,
-      std::size_t count) noexcept;
+      ParkStripe* stripes, std::size_t ring_mask, std::size_t stripe_mask,
+      std::uint64_t base_ticket, std::size_t count) noexcept;
   [[gnu::cold]] static void park_stripe_epoch(ParkStripe& stripe,
                                               std::uint32_t ep,
                                               std::uint8_t mode) noexcept;
@@ -184,11 +184,12 @@ class alignas(kHardwareDestructiveInterferenceSize) StripedParkLot {
   }
 
   THETA_FORCE_INLINE void notify_range(std::uint64_t base_ticket,
-                                       std::size_t count) noexcept {
+                                       std::size_t count,
+                                       std::size_t ring_mask) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (blocking_active_.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
-      StripedParkLotBase::notify_range_active_slow(stripes_.data(), kStripeMask,
-                                                   base_ticket, count);
+      StripedParkLotBase::notify_range_active_slow(
+          stripes_.data(), ring_mask, kStripeMask, base_ticket, count);
     }
   }
 

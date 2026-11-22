@@ -184,15 +184,17 @@ StripedParkLotBase::notify_ticket_active_slow(ParkStripe& stripe) noexcept {
 
 [[gnu::noinline, gnu::aligned(64)]] void
 StripedParkLotBase::notify_range_active_slow(ParkStripe* stripes,
+                                             std::size_t ring_mask,
                                              std::size_t stripe_mask,
                                              std::uint64_t base_ticket,
                                              std::size_t count) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  const std::size_t n = std::min<std::size_t>(count, stripe_mask + 1U);
+  const std::size_t max_unique = std::min(ring_mask + 1U, stripe_mask + 1U);
+  const std::size_t n = std::min(count, max_unique);
   THETA_SCALAR_LOOP
   for (std::size_t i = 0; i < n; ++i) {
     const std::size_t idx =
-        static_cast<std::size_t>(base_ticket + i) & stripe_mask;
+        (static_cast<std::size_t>(base_ticket + i) & ring_mask) & stripe_mask;
     if (stripes[idx].waiters.load(std::memory_order_relaxed) != 0U)
         [[unlikely]] {
       stripes[idx].epoch.fetch_add(1U, std::memory_order_seq_cst);

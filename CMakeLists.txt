@@ -119,7 +119,16 @@ if(BUILD_BENCHMARK
     target_compile_options(queue_benchmark PRIVATE -mcx16)
   endif()
 
-  if(theta-mutex_FOUND)
+  set(_use_pkg_theta_mutex OFF)
+  if(theta-mutex_FOUND AND TARGET theta::theta-mutex)
+    get_target_property(_tm_inc theta::theta-mutex
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    if(_tm_inc AND EXISTS "${_tm_inc}/theta/mutex.hpp")
+      set(_use_pkg_theta_mutex ON)
+    endif()
+  endif()
+
+  if(_use_pkg_theta_mutex)
     target_link_libraries(queue_benchmark PRIVATE theta::theta-mutex)
     target_compile_definitions(queue_benchmark
                                PRIVATE THETA_QUEUE_HAS_THETA_MUTEX=1)
@@ -161,6 +170,10 @@ if(BUILD_BENCHMARK
     target_link_libraries(queue_benchmark PRIVATE PkgConfig::COMP_FOLLY)
     target_compile_options(
       queue_benchmark PRIVATE $<$<CXX_COMPILER_ID:Clang>:-fno-sanitize=vptr>)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+      target_compile_options(queue_benchmark
+                             PRIVATE -march=armv8.2-a+lse+rcpc+nocrc)
+    endif()
     target_compile_definitions(queue_benchmark PRIVATE THETA_QUEUE_HAS_FOLLY=1)
     if(NOT BOOST_LOCKFREE_INCLUDE_DIR)
       target_compile_definitions(queue_benchmark

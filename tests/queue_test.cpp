@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -920,6 +921,106 @@ TEST(ConventionsAndPeerTest, MultiTuOdrAndTwoTierStateTransitions) {
     EXPECT_EQ(queue::detail::QueueTestPeer::rseq_overflow_ops(fast_mpsc), 0U);
   }
   EXPECT_EQ(fast_mpsc.try_pop(), 99U);
+}
+
+TEST(FastRseqQueueTest, OversubscribedMultiRoundBarrierConservation) {
+  constexpr std::ptrdiff_t kPairs = arch::kTsanEnabled ? 6 : 12;
+  constexpr std::size_t kBatch = arch::kTsanEnabled ? 512U : 4096U;
+  constexpr int kRounds = arch::kTsanEnabled ? 6 : 40;
+  constexpr std::size_t kTotalPerRound =
+      static_cast<std::size_t>(kPairs) * kBatch;
+  constexpr uint64_t kExpectedRoundSum =
+      (static_cast<uint64_t>(kTotalPerRound) * (kTotalPerRound + 1U)) / 2U;
+
+  FastMPMCQueue<uint64_t, 1024> q;
+  std::barrier start_batch(2 * kPairs);
+  std::barrier end_batch(2 * kPairs);
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> round_sum{0};
+
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<std::size_t>((2 * kPairs) - 1));
+
+  for (std::ptrdiff_t p = 1; p < kPairs; ++p) {
+    workers.emplace_back([&, p]() {
+      while (true) {
+        start_batch.arrive_and_wait();
+        if (stop.load(std::memory_order_relaxed)) {
+          return;
+        }
+        const std::size_t base = static_cast<std::size_t>(p) * kBatch;
+        for (std::size_t i = 0; i < kBatch; ++i) {
+          const uint64_t val = base + i + 1U;
+          while (!q.try_push(val)) {
+            arch::cpu_relax();
+          }
+        }
+        end_batch.arrive_and_wait();
+      }
+    });
+  }
+
+  for (std::ptrdiff_t c = 0; c < kPairs; ++c) {
+    workers.emplace_back([&]() {
+      while (true) {
+        start_batch.arrive_and_wait();
+        if (stop.load(std::memory_order_relaxed)) {
+          return;
+        }
+        uint64_t local_sum = 0;
+        for (std::size_t i = 0; i < kBatch; ++i) {
+          while (true) {
+            if (auto v = q.try_pop(); v.has_value()) {
+              local_sum += *v;
+              break;
+            }
+            arch::cpu_relax();
+          }
+        }
+        round_sum.fetch_add(local_sum, std::memory_order_relaxed);
+        end_batch.arrive_and_wait();
+      }
+    });
+  }
+
+  for (int r = 0; r < kRounds; ++r) {
+    round_sum.store(0U, std::memory_order_relaxed);
+    start_batch.arrive_and_wait();
+    for (std::size_t i = 0; i < kBatch; ++i) {
+      const uint64_t val = i + 1U;
+      while (!q.try_push(val)) {
+        arch::cpu_relax();
+      }
+    }
+    end_batch.arrive_and_wait();
+    EXPECT_EQ(round_sum.load(std::memory_order_relaxed), kExpectedRoundSum);
+  }
+
+  stop.store(true, std::memory_order_relaxed);
+  start_batch.arrive_and_wait();
+  for (auto& w : workers) {
+    w.join();
+  }
+  EXPECT_TRUE(q.empty());
+}
+
+TEST(BulkAndDrainTest, SmallRingWrapAroundStripedParkWakeup) {
+  MPMCQueue<uint64_t, 4> q;
+  // Advance head and tail to index 3 (`3 & 3 == 3`) so a 2-item batch wraps
+  // across ring slots `3` and `0` (`cap < kStripes`).
+  for (uint64_t i = 0; i < 3U; ++i) {
+    ASSERT_TRUE(q.try_push(i));
+    ASSERT_EQ(q.try_pop(), i);
+  }
+  std::atomic<uint64_t> sum{0};
+  std::thread c0([&]() { sum.fetch_add(q.pop(), std::memory_order_relaxed); });
+  std::thread c1([&]() { sum.fetch_add(q.pop(), std::memory_order_relaxed); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const std::array<uint64_t, 2> batch{10U, 20U};
+  EXPECT_EQ(q.try_push_bulk(std::span<const uint64_t>{batch}), 2U);
+  c0.join();
+  c1.join();
+  EXPECT_EQ(sum.load(), 30U);
 }
 
 }  // namespace

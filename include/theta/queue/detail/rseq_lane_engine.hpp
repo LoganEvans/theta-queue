@@ -33,7 +33,7 @@ namespace theta::queue::detail {
 //   active CPUs (`cpu_id + 1` in `[1..8192]`) onto 7 cache-isolated SPSC lanes
 //   (`sizeof(LaneMeta) == 256` -> 1-cycle `shlq $8` indexing).
 // - Overflow & Migration (`> 7` CPUs): Extra CPUs push to `fallback_` (`Lane 0`
-//   `HybridFaaRing`); cold CAM slot assignment, `MEMBARRIER_RSEQ` recycling,
+//   `StrictFIFO` ring); cold CAM slot assignment, `MEMBARRIER_RSEQ` recycling,
 //   and work-stealing state transitions live in `src/queue.cpp`.
 // ============================================================================
 template <QueueElement T, std::size_t kStaticBufferSize, bool kMultiConsumer,
