@@ -20,6 +20,7 @@
 #include <span>
 #include <string>
 #include <theta/queue.hpp>
+#include <theta/queue/detail/scq_ring.hpp>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1207,6 +1208,90 @@ TEST(ConventionsAndPeerTest, FastMPMCOversubscribedBlockingConservation) {
   for (auto& w : workers) {
     w.join();
   }
+}
+
+TEST(ConventionsAndPeerTest, SCQStrictFifoAndOversubscribedConservation) {
+  // 1. Exact FIFO + capacity + empty cancellation check on both 1-ring & 2-ring
+  // SCQ.
+  std::array<int, 32> items{};
+  for (int i = 0; i < 32; ++i) {
+    items[static_cast<std::size_t>(i)] = i + 1;
+  }
+  queue::detail::SCQSingleRingPtrQueue<int*, 16> scq1;
+  queue::detail::SCQTwoRingQueue<int*, 16> scq2;
+  for (int e = 0; e < 40; ++e) {
+    EXPECT_EQ(scq1.try_pop(), std::nullopt);
+    EXPECT_EQ(scq2.try_pop(), std::nullopt);
+  }
+  for (std::size_t i = 0; i < 16U; ++i) {
+    ASSERT_TRUE(scq1.try_push(&items[i]));
+    ASSERT_TRUE(scq2.try_push(&items[i]));
+  }
+  EXPECT_FALSE(scq1.try_push(&items[16]));
+  EXPECT_FALSE(scq2.try_push(&items[16]));
+  for (std::size_t i = 0; i < 16U; ++i) {
+    ASSERT_EQ(scq1.try_pop(), &items[i]);
+    ASSERT_EQ(scq2.try_pop(), &items[i]);
+  }
+  EXPECT_EQ(scq1.try_pop(), std::nullopt);
+  EXPECT_EQ(scq2.try_pop(), std::nullopt);
+
+  // 2. Oversubscribed 8P + 8C conservation on both 1-ring & 2-ring SCQ
+  // (MoveOnly).
+  std::atomic<int64_t> live{0};
+  {
+    constexpr int kPairs = 8;
+    constexpr std::size_t kPerProd = arch::kTsanEnabled ? 500 : 3'000;
+    constexpr uint64_t kTotal = static_cast<uint64_t>(kPairs) * kPerProd;
+    queue::detail::SCQSingleRingPtrQueue<int*, 128> mpmc1;
+    queue::detail::SCQTwoRingQueue<TrackedMoveOnly, 128> mpmc2;
+    std::atomic<uint64_t> sum1{0};
+    std::atomic<uint64_t> sum2{0};
+    int dummy = 7;
+
+    std::vector<std::thread> threads;
+    threads.reserve(2 * kPairs);
+    for (int p = 0; p < kPairs; ++p) {
+      threads.emplace_back([&, p]() {
+        const uint64_t base = static_cast<uint64_t>(p) * kPerProd + 1U;
+        for (std::size_t i = 0; i < kPerProd; ++i) {
+          while (!mpmc1.try_push(&dummy)) {
+            ::theta::arch::cpu_relax();
+          }
+          TrackedMoveOnly tok{&live, base + i};
+          while (!mpmc2.try_push(std::move(tok))) {
+            ::theta::arch::cpu_relax();
+          }
+        }
+      });
+    }
+    for (int c = 0; c < kPairs; ++c) {
+      threads.emplace_back([&]() {
+        uint64_t c1 = 0;
+        uint64_t s2 = 0;
+        for (std::size_t i = 0; i < kPerProd; ++i) {
+          while (!mpmc1.try_pop().has_value()) {
+            ::theta::arch::cpu_relax();
+          }
+          ++c1;
+          std::optional<TrackedMoveOnly> out;
+          while (!(out = mpmc2.try_pop()).has_value()) {
+            ::theta::arch::cpu_relax();
+          }
+          s2 += out->value();
+        }
+        sum1.fetch_add(c1, std::memory_order_relaxed);
+        sum2.fetch_add(s2, std::memory_order_relaxed);
+      });
+    }
+    for (auto& t : threads) {
+      t.join();
+    }
+    EXPECT_EQ(sum1.load(), kTotal);
+    EXPECT_EQ(sum2.load(), (kTotal * (kTotal + 1U)) / 2U);
+    EXPECT_TRUE(mpmc2.empty());
+  }
+  EXPECT_EQ(live.load(), 0);
 }
 
 }  // namespace

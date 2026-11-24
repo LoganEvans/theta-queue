@@ -21,6 +21,7 @@
 #include <span>
 #include <theta/arch.hpp>
 #include <theta/queue.hpp>
+#include <theta/queue/detail/scq_ring.hpp>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -244,6 +245,20 @@ struct ThetaUMPMCAdaptor {
   int* pop() { return queue.pop(); }
 
   UMPMCQueue<int*, 9> queue{};
+};
+
+struct ThetaSCQSingleRingAdaptor {
+  bool try_push(int* v) { return queue.try_push(v); }
+  std::optional<int*> try_pop() { return queue.try_pop(); }
+
+  queue::detail::SCQSingleRingPtrQueue<int*, kBenchQueueCapacity> queue{};
+};
+
+struct ThetaSCQTwoRingAdaptor {
+  bool try_push(int* v) { return queue.try_push(v); }
+  std::optional<int*> try_pop() { return queue.try_pop(); }
+
+  queue::detail::SCQTwoRingQueue<int*, kBenchQueueCapacity> queue{};
 };
 
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
@@ -791,6 +806,8 @@ BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaFastMPSCAdaptor);
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaUSPSCAdaptor);
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaUMPSCAdaptor);
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaUMPMCAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaSCQSingleRingAdaptor);
+BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, ThetaSCQTwoRingAdaptor);
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, AtomicQueueAdaptor);
 BENCHMARK_TEMPLATE(BM_SingleThreadTryRoundtrip, AtomicQueueSPSCAdaptor);
@@ -842,6 +859,10 @@ BENCHMARK_TEMPLATE(BM_CrossCorePingPong, ThetaFastMPMCAdaptor, true)
 BENCHMARK_TEMPLATE(BM_CrossCorePingPong, ThetaMPSCAdaptor, true)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_CrossCorePingPong, ThetaFastMPSCAdaptor, true)
     ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_CrossCorePingPong, ThetaSCQSingleRingAdaptor, true)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_CrossCorePingPong, ThetaSCQTwoRingAdaptor, true)
+    ->UseRealTime();
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_CrossCorePingPong, AtomicQueueAdaptor, true)
     ->UseRealTime();
@@ -882,6 +903,8 @@ BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaMPMCStaticAdaptor)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaFastMPMCAdaptor)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaMPSCAdaptor)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaFastMPSCAdaptor)->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaSCQSingleRingAdaptor)->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SPSC_Try, ThetaSCQTwoRingAdaptor)->UseRealTime();
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_SPSC_Try, AtomicQueueAdaptor)->UseRealTime();
 BENCHMARK_TEMPLATE(BM_SPSC_Try, AtomicQueueSPSCAdaptor)->UseRealTime();
@@ -909,6 +932,8 @@ BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaMPMCStaticAdaptor) THETA_MPSC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaMPSCAdaptor) THETA_MPSC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaFastMPSCAdaptor) THETA_MPSC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaUMPSCAdaptor) THETA_MPSC_ARGS;
+BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaSCQSingleRingAdaptor) THETA_MPSC_ARGS;
+BENCHMARK_TEMPLATE(BM_MPSC_Try, ThetaSCQTwoRingAdaptor) THETA_MPSC_ARGS;
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_MPSC_Try, AtomicQueueAdaptor) THETA_MPSC_ARGS;
 #endif
@@ -933,6 +958,8 @@ BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaMPMCStaticAdaptor) THETA_MPMC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaMPMCDynamicAdaptor) THETA_MPMC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaFastMPMCAdaptor) THETA_MPMC_ARGS;
 BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaUMPMCAdaptor) THETA_MPMC_ARGS;
+BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaSCQSingleRingAdaptor) THETA_MPMC_ARGS;
+BENCHMARK_TEMPLATE(BM_MPMC_Try, ThetaSCQTwoRingAdaptor) THETA_MPMC_ARGS;
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_MPMC_Try, AtomicQueueAdaptor) THETA_MPMC_ARGS;
 #endif
