@@ -87,6 +87,9 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
     }
     const std::uint32_t ep = s->epoch.load(std::memory_order_relaxed);
     s->waiters.fetch_add(1U, std::memory_order_seq_cst);
+#if THETA_ARCH_AARCH64
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
     if (!pred()) {
       park_epoch(s, ep, mode);
     }
@@ -130,6 +133,9 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
     ParkStripe& st = s->stripes[stripe_idx];
     const std::uint32_t ep = st.epoch.load(std::memory_order_relaxed);
     st.waiters.fetch_add(1U, std::memory_order_seq_cst);
+#if THETA_ARCH_AARCH64
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
     if (!pred()) {
       StripedParkLotBase::park_stripe_epoch(st, ep, mode);
     }

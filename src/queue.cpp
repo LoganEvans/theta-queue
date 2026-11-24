@@ -343,7 +343,7 @@ RseqLaneCore::try_assign_prod_slot_slow() noexcept {
         if (s == 1U) {
           __atomic_store_n(&prod_biased, std::uint8_t{1}, __ATOMIC_RELEASE);
         } else if (__atomic_load_n(&prod_biased, __ATOMIC_RELAXED) != 0U) {
-          __atomic_store_n(&prod_biased, std::uint8_t{0}, __ATOMIC_RELAXED);
+          __atomic_store_n(&prod_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
           (void)asymmetric_membarrier_rseq_expedited();
         }
         num_prod.store(s, std::memory_order_release);
@@ -368,9 +368,9 @@ RseqLaneCore::maybe_recycle_prod_cam() noexcept {
   if (tail_sum == last_recycle_tail_sum &&
       num_prod.load(std::memory_order_relaxed) == kMaxRseqPreferred) {
     auto* cam_words = reinterpret_cast<std::uint64_t*>(prod_cam.data());
-    __atomic_store_n(&cam_words[0], std::uint64_t{0}, __ATOMIC_RELAXED);
-    __atomic_store_n(&cam_words[1], std::uint64_t{0}, __ATOMIC_RELAXED);
-    __atomic_store_n(&prod_biased, std::uint8_t{0}, __ATOMIC_RELAXED);
+    __atomic_store_n(&cam_words[0], std::uint64_t{0}, __ATOMIC_RELEASE);
+    __atomic_store_n(&cam_words[1], std::uint64_t{0}, __ATOMIC_RELEASE);
+    __atomic_store_n(&prod_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
     (void)asymmetric_membarrier_rseq_expedited();
     num_prod.store(0U, std::memory_order_release);
   }
@@ -402,7 +402,7 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
             __atomic_load_n(&meta[0].cons_exclusive, __ATOMIC_RELAXED) != 0U) {
           __atomic_store_n(&cons_biased, std::uint8_t{1}, __ATOMIC_RELEASE);
         } else if (__atomic_load_n(&cons_biased, __ATOMIC_RELAXED) != 0U) {
-          __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELAXED);
+          __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
           (void)asymmetric_membarrier_rseq_expedited();
         }
         num_cons.store(s, std::memory_order_release);
@@ -431,7 +431,7 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
     LaneMeta& m = meta[idx];
     std::uint64_t h = __atomic_load_n(&m.head, __ATOMIC_ACQUIRE);
     std::uint64_t t = __atomic_load_n(&m.tail, __ATOMIC_ACQUIRE);
-    if (h == t) {
+    if (h >= t) {
       continue;
     }
 
@@ -444,23 +444,23 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
       }
       const ColdSpinGuard guard(cam_lock);
       if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_RELAXED) != 0U) {
-        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELAXED);
-        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_RELAXED);
+        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
+        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_RELEASE);
         (void)asymmetric_membarrier_rseq_expedited();
       }
     }
 
-    h = __atomic_load_n(&m.head, __ATOMIC_RELAXED);
+    h = __atomic_load_n(&m.head, __ATOMIC_ACQUIRE);
     for (;;) {
       t = __atomic_load_n(&m.tail, __ATOMIC_ACQUIRE);
-      if (h == t) {
+      if (h >= t) {
         break;
       }
       const std::uint64_t val =
           __atomic_load_n(&m.data_cons[h & m.mask_cons], __ATOMIC_RELAXED);
       const std::uint64_t next_h = h + 1U;
       if (__atomic_compare_exchange_n(&m.head, &h, next_h, true,
-                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         out = val;
         g_steal_cursor = idx;
         return 1;

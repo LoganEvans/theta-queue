@@ -1083,5 +1083,57 @@ TEST(ConventionsAndPeerTest,
   }
 }
 
+TEST(ConventionsAndPeerTest, FastMPMCOversubscribedBlockingConservation) {
+  constexpr int kPairs = 6;
+  constexpr std::size_t kItemsPerProd = 4096;
+  constexpr int kRounds = 16;
+  FastMPMCQueue<uint64_t, 512> q;
+  std::barrier start_round(2 * kPairs);
+  std::barrier end_round(2 * kPairs);
+  std::atomic<uint64_t> round_sum{0};
+
+  std::vector<std::thread> workers;
+  workers.reserve(2 * kPairs);
+  for (int p = 0; p < kPairs; ++p) {
+    workers.emplace_back([&, p]() {
+      for (int r = 0; r < kRounds; ++r) {
+        start_round.arrive_and_wait();
+        const uint64_t base = static_cast<uint64_t>(p) * kItemsPerProd + 1U;
+        for (std::size_t i = 0; i < kItemsPerProd; ++i) {
+          q.push(base + i);
+        }
+        end_round.arrive_and_wait();
+      }
+    });
+  }
+  for (int c = 0; c < kPairs; ++c) {
+    workers.emplace_back([&, c]() {
+      for (int r = 0; r < kRounds; ++r) {
+        if (c == 0) {
+          round_sum.store(0U, std::memory_order_relaxed);
+        }
+        start_round.arrive_and_wait();
+        uint64_t local_sum = 0U;
+        for (std::size_t i = 0; i < kItemsPerProd; ++i) {
+          local_sum += q.pop();
+        }
+        round_sum.fetch_add(local_sum, std::memory_order_relaxed);
+        end_round.arrive_and_wait();
+        if (c == 0) {
+          constexpr uint64_t kTotalItems =
+              static_cast<uint64_t>(kPairs) * kItemsPerProd;
+          constexpr uint64_t kExpected =
+              (kTotalItems * (kTotalItems + 1U)) / 2U;
+          EXPECT_EQ(round_sum.load(std::memory_order_relaxed), kExpected);
+          EXPECT_TRUE(q.empty());
+        }
+      }
+    });
+  }
+  for (auto& w : workers) {
+    w.join();
+  }
+}
+
 }  // namespace
 }  // namespace theta

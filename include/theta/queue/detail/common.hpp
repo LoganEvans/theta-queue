@@ -166,7 +166,7 @@ class AsymmetricParkLot {
   }
 
   template <typename StopPred>
-  THETA_ALIGNED_NOINLINE void wait_until(StopPred&& pred) noexcept {
+  THETA_FORCE_INLINE void wait_until(StopPred&& pred) noexcept {
     wait_slot_until(state_, std::forward<StopPred>(pred));
   }
 
