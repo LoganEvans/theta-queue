@@ -625,9 +625,12 @@ TEST(RichPayloadTest, MoveOnlyNoDefaultAndDestructorCleanupOnDestroy) {
 
 TEST(RichPayloadTest, LargeAndOverAlignedPayloads) {
   MPMCQueue<Payload256, 16> large_mpmc;
+  FastMPSCQueue<Payload256, 16> large_fmpsc;
+  FastMPMCQueue<Payload256, 16> large_fmpmc;
   UMPMCQueue<Payload256, 4> large_umpmc;
   SPSCQueue<AlignedSimd64, 16> simd_spsc;
   MPMCQueue<AlignedSimd64, 16> simd_mpmc;
+  FastMPMCQueue<AlignedSimd64, 16> simd_fmpmc;
   UMPMCQueue<AlignedSimd64, 4> simd_umpmc;
 
   for (uint64_t i = 1; i <= 12; ++i) {
@@ -635,6 +638,8 @@ TEST(RichPayloadTest, LargeAndOverAlignedPayloads) {
     p.words[0] = i;
     p.words[31] = i * 100U;
     ASSERT_TRUE(large_mpmc.try_push(p));
+    ASSERT_TRUE(large_fmpsc.try_push(p));
+    ASSERT_TRUE(large_fmpmc.try_push(p));
     large_umpmc.push(p);
 
     AlignedSimd64 a{};
@@ -642,24 +647,93 @@ TEST(RichPayloadTest, LargeAndOverAlignedPayloads) {
     a.lanes[7] = i * 7U;
     ASSERT_TRUE(simd_spsc.try_push(a));
     ASSERT_TRUE(simd_mpmc.try_push(a));
+    ASSERT_TRUE(simd_fmpmc.try_push(a));
     simd_umpmc.push(a);
   }
 
   for (uint64_t i = 1; i <= 12; ++i) {
     const auto p1 = large_mpmc.pop();
+    const auto pf1 = large_fmpsc.pop();
+    const auto pf2 = large_fmpmc.pop();
     const auto p2 = large_umpmc.pop();
     EXPECT_EQ(p1.words[0], i);
     EXPECT_EQ(p1.words[31], i * 100U);
+    EXPECT_EQ(pf1.words[0], i);
+    EXPECT_EQ(pf1.words[31], i * 100U);
+    EXPECT_EQ(pf2.words[0], i);
+    EXPECT_EQ(pf2.words[31], i * 100U);
     EXPECT_EQ(p2.words[0], i);
     EXPECT_EQ(p2.words[31], i * 100U);
 
     const auto a1 = simd_spsc.pop();
     const auto a2 = simd_mpmc.pop();
+    const auto af = simd_fmpmc.pop();
     const auto a3 = simd_umpmc.pop();
     EXPECT_EQ(a1.lanes[7], i * 7U);
     EXPECT_EQ(a2.lanes[7], i * 7U);
+    EXPECT_EQ(af.lanes[7], i * 7U);
     EXPECT_EQ(a3.lanes[7], i * 7U);
   }
+
+  // Verify failed `try_push(std::move(item))` preserves `item` unconsumed and
+  // oversubscribed 10P + 4C `TrackedMoveOnly` maintains exact live count = 0.
+  std::atomic<int64_t> live{0};
+  {
+    FastMPMCQueue<TrackedMoveOnly, 4> small_q;
+    for (uint64_t i = 1; i <= 4; ++i) {
+      ASSERT_TRUE(small_q.try_push(TrackedMoveOnly{&live, i}));
+    }
+    TrackedMoveOnly extra{&live, 999U};
+    EXPECT_FALSE(small_q.try_push(std::move(extra)));
+    EXPECT_EQ(extra.value(), 999U);
+    EXPECT_EQ(live.load(), 5);
+  }
+  EXPECT_EQ(live.load(), 0);
+
+  {
+    constexpr std::size_t kProd = 10;
+    constexpr std::size_t kCons = 4;
+    constexpr uint64_t kPerProd = arch::kTsanEnabled ? 500 : 2'000;
+    constexpr uint64_t kTotal = kProd * kPerProd;
+    FastMPMCQueue<TrackedMoveOnly, 64> rich_q;
+    std::atomic<uint64_t> popped_sum{0};
+
+    std::vector<std::thread> consumers;
+    consumers.reserve(kCons);
+    for (std::size_t c = 0; c < kCons; ++c) {
+      consumers.emplace_back([&, c]() {
+        const uint64_t quota =
+            (kTotal / kCons) + (c == 0 ? (kTotal % kCons) : 0U);
+        uint64_t s = 0;
+        for (uint64_t i = 0; i < quota; ++i) {
+          const auto item = rich_q.pop();
+          s += item.value();
+        }
+        popped_sum.fetch_add(s, std::memory_order_relaxed);
+      });
+    }
+
+    std::vector<std::thread> producers;
+    producers.reserve(kProd);
+    for (std::size_t p = 0; p < kProd; ++p) {
+      producers.emplace_back([&, p]() {
+        const uint64_t base = p * kPerProd + 1U;
+        for (uint64_t i = 0; i < kPerProd; ++i) {
+          rich_q.emplace(&live, base + i);
+        }
+      });
+    }
+
+    for (auto& t : producers) {
+      t.join();
+    }
+    for (auto& t : consumers) {
+      t.join();
+    }
+    EXPECT_EQ(popped_sum.load(), (kTotal * (kTotal + 1U)) / 2U);
+    EXPECT_TRUE(rich_q.empty());
+  }
+  EXPECT_EQ(live.load(), 0);
 }
 
 // ============================================================================

@@ -274,6 +274,30 @@ StripedParkLotBase::notify_range_active_slow(StripedParkState* state,
   (void)asymmetric_membarrier_rseq_expedited();
 }
 
+[[gnu::noinline, gnu::aligned(64)]] void RseqLaneCore::init_rich_turns(
+    std::size_t cap, bool multi_consumer,
+    std::uint64_t* base_turn_ptr) noexcept {
+  lane_cap = cap;
+  lane_buf = nullptr;
+  const std::uint64_t m = cap - 1U;
+  constexpr std::size_t kU64PerTurnLine = 64U / sizeof(std::uint64_t);
+  THETA_SCALAR_LOOP
+  for (std::size_t i = 0; i < kMaxRseqPreferred; ++i) {
+    std::uint64_t* const lt = base_turn_ptr + (i * cap * kU64PerTurnLine);
+    THETA_SCALAR_LOOP
+    for (std::size_t j = 0; j < cap; ++j) {
+      lt[j * kU64PerTurnLine] = static_cast<std::uint64_t>(j) * 2ULL;
+    }
+    meta[i].data_prod = lt;
+    meta[i].cap_prod = cap;
+    meta[i].mask_prod = m;
+    meta[i].data_cons = lt;
+    meta[i].mask_cons = m;
+    meta[i].cons_exclusive = multi_consumer ? 1U : 0U;
+  }
+  (void)asymmetric_membarrier_rseq_expedited();
+}
+
 [[gnu::noinline, gnu::aligned(64)]] void RseqLaneCore::destroy() noexcept {
   aligned_free_uninit(lane_buf);
   lane_buf = nullptr;
@@ -462,6 +486,62 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
       if (__atomic_compare_exchange_n(&m.head, &h, next_h, true,
                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         out = val;
+        g_steal_cursor = idx;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+[[gnu::noinline, gnu::aligned(64)]] int RseqLaneCore::try_steal_rich_slot_slow(
+    std::uint32_t& out_lane, std::uint64_t& out_ticket) noexcept {
+  const std::int32_t cpu = ArchBackend::current_cpu();
+  const std::uint16_t self_target = (cpu >= 0 && cpu < kMaxTrackedQueueCpus)
+                                        ? static_cast<std::uint16_t>(cpu + 1)
+                                        : std::uint16_t{0};
+  constexpr std::size_t kU64PerTurnLine = 64U / sizeof(std::uint64_t);
+
+  THETA_SCALAR_LOOP
+  for (std::uint8_t step = 0; step < kMaxRseqPreferred; ++step) {
+    const auto idx =
+        static_cast<std::uint8_t>((g_steal_cursor + step) % kMaxRseqPreferred);
+    LaneMeta& m = meta[idx];
+    std::uint64_t h = __atomic_load_n(&m.head, __ATOMIC_ACQUIRE);
+    const std::size_t off0 =
+        static_cast<std::size_t>(h & m.mask_cons) * kU64PerTurnLine;
+    if (__atomic_load_n(&m.data_cons[off0], __ATOMIC_ACQUIRE) !=
+        (h * 2ULL) + 1ULL) {
+      continue;
+    }
+
+    if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_ACQUIRE) != 0U) {
+      if (self_target != 0U &&
+          __atomic_load_n(&cons_cam[idx + 1U], __ATOMIC_RELAXED) ==
+              self_target) {
+        return -1;
+      }
+      const ColdSpinGuard guard(cam_lock);
+      if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_RELAXED) != 0U) {
+        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
+        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_RELEASE);
+        (void)asymmetric_membarrier_rseq_expedited();
+      }
+    }
+
+    h = __atomic_load_n(&m.head, __ATOMIC_ACQUIRE);
+    for (;;) {
+      const std::size_t off =
+          static_cast<std::size_t>(h & m.mask_cons) * kU64PerTurnLine;
+      if (__atomic_load_n(&m.data_cons[off], __ATOMIC_ACQUIRE) !=
+          (h * 2ULL) + 1ULL) {
+        break;
+      }
+      const std::uint64_t next_h = h + 1U;
+      if (__atomic_compare_exchange_n(&m.head, &h, next_h, true,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        out_lane = idx;
+        out_ticket = h;
         g_steal_cursor = idx;
         return 1;
       }

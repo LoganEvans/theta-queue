@@ -22,16 +22,98 @@
 
 namespace theta::queue::detail {
 
+struct EmptyRichLanePool {};
+
+// Per-lane storage for `> 8B` or non-trivial/move-only payloads
+// (`!kWord8Trivial`):
+// - Fuses `{uint64_t turn, RawSlotStorage<T>}` into a single 64B cache line
+//   when `sizeof(T) <= 56 && alignof(T) <= 32` (e.g. `MoveOnly32`), so turn
+//   acquisition pulls `T` into L1D in a single coherence transfer.
+// - Separates 64B-strided `RichTurnLine[]` and `RawSlotStorage<T>[]` for larger
+//   or `>= 64B`-aligned payloads (`Payload64`, `Payload256`, `AlignedSimd64`).
+template <typename T, bool kFuse = (sizeof(T) <= 56U && alignof(T) <= 32U)>
+class RichLanePool;
+
+template <typename T>
+class RichLanePool<T, true> {
+  struct alignas(64) FusedRichSlot {
+    std::uint64_t turn;
+    RawSlotStorage<T> val;
+  };
+  static_assert(sizeof(FusedRichSlot) == 64);
+  static_assert(offsetof(FusedRichSlot, turn) == 0);
+
+ public:
+  void init(std::size_t total_slots) {
+    slots_ = aligned_alloc_uninit<FusedRichSlot>(total_slots);
+  }
+
+  void destroy() noexcept {
+    aligned_free_uninit(slots_);
+    slots_ = nullptr;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE std::uint64_t* base_turn_ptr() noexcept {
+    return &slots_[0].turn;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE std::uint64_t* turn_ptr(
+      std::size_t flat) noexcept {
+    return &slots_[flat].turn;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE RawSlotStorage<T>& storage(
+      std::size_t flat) noexcept {
+    return slots_[flat].val;
+  }
+
+ private:
+  FusedRichSlot* slots_{nullptr};
+};
+
+template <typename T>
+class RichLanePool<T, false> {
+ public:
+  void init(std::size_t total_slots) {
+    turns_ = aligned_alloc_uninit<RichTurnLine>(total_slots);
+    vals_ = aligned_alloc_uninit<RawSlotStorage<T>>(total_slots);
+  }
+
+  void destroy() noexcept {
+    aligned_free_uninit(turns_);
+    aligned_free_uninit(vals_);
+    turns_ = nullptr;
+    vals_ = nullptr;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE std::uint64_t* base_turn_ptr() noexcept {
+    return &turns_[0].turn;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE std::uint64_t* turn_ptr(
+      std::size_t flat) noexcept {
+    return &turns_[flat].turn;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE RawSlotStorage<T>& storage(
+      std::size_t flat) noexcept {
+    return vals_[flat];
+  }
+
+ private:
+  RichTurnLine* turns_{nullptr};
+  RawSlotStorage<T>* vals_{nullptr};
+};
+
 // ============================================================================
-// 2-Tier Linux `rseq` + 7-Slot SIMD CPU CAM Multi-Lane Queue Engine
+// 2-Tier Linux `rseq` + 7-Slot SIMD/SWAR CPU CAM Multi-Lane Queue Engine
 // (`QueueOrder::PerProducer` backend for `FastMPSCQueue` & `FastMPMCQueue`).
 //
-// - Tier 1 (`prod_biased == 1` / `cons_biased == 1`): 2-instruction `movzwl`
-//   bijection check + offset-`0` `meta[0]` addressing (`0` SSE2, `0` shift,
-//   `0` LOCK instructions).
-// - Tier 2 (`prod_biased == 0`): 16-byte SIMD inverse CAM mapping up to 7
-//   active CPUs (`cpu_id + 1` in `[1..8192]`) onto 7 cache-isolated SPSC lanes
-//   (`sizeof(LaneMeta) == 256` -> 1-cycle `shlq $8` indexing).
+// - Word Mode (`<= 8B` trivially copyable/destructible): single-instruction
+//   inline register store/load inside `rseq`.
+// - Rich Mode (`> 8B`, move-only, or non-trivial payloads): `rseq` reserves
+//   only `(lane, ticket)` against a 64B-strided turn word; `T` construction,
+//   move-extraction, destruction, and turn release execute 100% outside `rseq`.
 // - Overflow & Migration (`> 7` CPUs): Extra CPUs push to `fallback_` (`Lane 0`
 //   `StrictFIFO` ring); cold CAM slot assignment, `MEMBARRIER_RSEQ` recycling,
 //   and work-stealing state transitions live in `src/queue.cpp`.
@@ -43,8 +125,12 @@ class RseqLaneEngine {
   static constexpr bool kWord8Trivial = std::is_trivially_copyable_v<T> &&
                                         std::is_trivially_destructible_v<T> &&
                                         (sizeof(T) <= 8U) && (alignof(T) <= 8U);
-  static constexpr bool kUseRseqLanes =
+  static constexpr bool kUseWordLanes =
       ArchBackend::kHasRseqLanes && kWord8Trivial;
+  static constexpr bool kUseRichLanes =
+      ArchBackend::kHasRseqLanes && !kWord8Trivial;
+  static constexpr bool kUseAnyRseqLanes = ArchBackend::kHasRseqLanes;
+  static constexpr bool kUseRseqLanes = kUseAnyRseqLanes;
 
   static constexpr std::size_t resolve_lane_cap(
       const QueueOpts& opts) noexcept {
@@ -75,14 +161,33 @@ class RseqLaneEngine {
 
   explicit RseqLaneEngine(const QueueOpts& opts = QueueOpts{})
       : fallback_(opts) {
-    core_.lane_cap = resolve_lane_cap(opts);
-    if constexpr (kUseRseqLanes) {
-      core_.init(core_.lane_cap, kMultiConsumer);
+    const std::size_t cap = resolve_lane_cap(opts);
+    core_.lane_cap = cap;
+    if constexpr (kUseWordLanes) {
+      core_.init(cap, kMultiConsumer);
+    } else if constexpr (kUseRichLanes) {
+      rich_.init(kMaxRseqPreferred * cap);
+      core_.init_rich_turns(cap, kMultiConsumer, rich_.base_turn_ptr());
     }
   }
 
   ~RseqLaneEngine() {
-    if constexpr (kUseRseqLanes) {
+    if constexpr (kUseWordLanes) {
+      core_.destroy();
+    } else if constexpr (kUseRichLanes) {
+      if constexpr (!std::is_trivially_destructible_v<T>) {
+        for (std::uint32_t i = 0; i < kMaxRseqPreferred; ++i) {
+          const std::uint64_t h = core_.meta[i].head;
+          const std::uint64_t t = core_.meta[i].tail;
+          for (std::uint64_t p = h; p < t; ++p) {
+            const std::size_t flat = rich_flat_index(i, p);
+            if (*rich_.turn_ptr(flat) == (p * 2ULL) + 1ULL) {
+              rich_.storage(flat).destroy();
+            }
+          }
+        }
+      }
+      rich_.destroy();
       core_.destroy();
     }
   }
@@ -96,16 +201,22 @@ class RseqLaneEngine {
     requires std::constructible_from<T, Args...>
   bool try_emplace(std::size_t* num_items, Args&&... args) noexcept(
       std::is_nothrow_constructible_v<T, Args...>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       if (num_items != nullptr) {
         const bool ok = fallback_.try_emplace(std::forward<Args>(args)...);
         *num_items = ok ? size() : capacity();
         return ok;
       }
       return fallback_.try_emplace(std::forward<Args>(args)...);
-    } else {
+    } else if constexpr (kUseWordLanes) {
       const T val(std::forward<Args>(args)...);
       const bool ok = try_push_word_fast(pack_word(val));
+      if (num_items != nullptr) {
+        *num_items = ok ? std::max<std::size_t>(1U, size()) : capacity();
+      }
+      return ok;
+    } else {
+      const bool ok = try_emplace_rich(std::forward<Args>(args)...);
       if (num_items != nullptr) {
         *num_items = ok ? std::max<std::size_t>(1U, size()) : capacity();
       }
@@ -123,16 +234,20 @@ class RseqLaneEngine {
   bool try_push(const T& val) noexcept(std::is_nothrow_copy_constructible_v<T>)
     requires std::copy_constructible<T>
   {
-    if constexpr (kUseRseqLanes) {
+    if constexpr (kUseWordLanes) {
       return try_push_word_fast(pack_word(val));
+    } else if constexpr (kUseRichLanes) {
+      return try_emplace_rich(val);
     } else {
       return fallback_.try_push(val);
     }
   }
 
   bool try_push(T&& val) noexcept {
-    if constexpr (kUseRseqLanes) {
+    if constexpr (kUseWordLanes) {
       return try_push_word_fast(pack_word(val));
+    } else if constexpr (kUseRichLanes) {
+      return try_emplace_rich(std::move(val));
     } else {
       return fallback_.try_push(std::move(val));
     }
@@ -159,13 +274,21 @@ class RseqLaneEngine {
   template <typename InputIt>
   std::size_t try_push_bulk(InputIt first, std::size_t count) noexcept(
       std::is_nothrow_constructible_v<T, decltype(*first)>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.try_push_bulk(first, count);
-    } else {
+    } else if constexpr (kUseWordLanes) {
       std::size_t pushed = 0U;
       for (; pushed < count; ++pushed, ++first) {
         const T item(*first);
         if (!try_push_word_fast(pack_word(item))) {
+          break;
+        }
+      }
+      return pushed;
+    } else {
+      std::size_t pushed = 0U;
+      for (; pushed < count; ++pushed, ++first) {
+        if (!try_emplace_rich(*first)) {
           break;
         }
       }
@@ -177,14 +300,20 @@ class RseqLaneEngine {
     requires std::constructible_from<T, Args...>
   void emplace(Args&&... args) noexcept(
       std::is_nothrow_constructible_v<T, Args...>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       fallback_.emplace(std::forward<Args>(args)...);
-    } else {
+    } else if constexpr (kUseWordLanes) {
       const std::uint64_t w = pack_word(T(std::forward<Args>(args)...));
       if (try_push_word_fast(w)) [[likely]] {
         return;
       }
       push_word_blocking_slow(w);
+    } else {
+      if (try_emplace_rich(std::forward<Args>(args)...)) [[likely]] {
+        return;
+      }
+      T pending(std::forward<Args>(args)...);
+      push_rich_blocking_slow(pending);
     }
   }
 
@@ -197,27 +326,31 @@ class RseqLaneEngine {
   void push(T&& val) noexcept { emplace(std::move(val)); }
 
   std::optional<T> try_pop() noexcept {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.try_pop();
-    } else {
+    } else if constexpr (kUseWordLanes) {
       std::uint64_t w = 0;
       if (!try_pop_word_fast(w)) {
         return std::nullopt;
       }
       return unpack_word(w);
+    } else {
+      return try_pop_rich_opt();
     }
   }
 
   bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.try_pop(out);
-    } else {
+    } else if constexpr (kUseWordLanes) {
       std::uint64_t w = 0;
       if (!try_pop_word_fast(w)) {
         return false;
       }
       out = unpack_word(w);
       return true;
+    } else {
+      return try_pop_rich_into(out);
     }
   }
 
@@ -225,7 +358,7 @@ class RseqLaneEngine {
   std::size_t
   try_pop_bulk(OutputIt out, std::size_t max_count = SIZE_MAX) noexcept(
       std::is_nothrow_move_assignable_v<T>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.try_pop_bulk(out, max_count);
     } else {
       return drain(
@@ -240,16 +373,31 @@ class RseqLaneEngine {
   template <typename Func>
   std::size_t drain(Func&& fn, std::size_t max_count = SIZE_MAX) noexcept(
       std::is_nothrow_invocable_v<Func&, T&&>) {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.drain(std::forward<Func>(fn), max_count);
-    } else if constexpr (!kMultiConsumer) {
-      return drain_sc(fn, max_count);
+    } else if constexpr (kUseWordLanes) {
+      if constexpr (!kMultiConsumer) {
+        return drain_sc(fn, max_count);
+      } else {
+        std::size_t count = 0U;
+        std::uint64_t w = 0;
+        while (count < max_count && try_pop_word_fast(w)) {
+          ++count;
+          if (!invoke_drain_visitor(fn, unpack_word(w))) {
+            break;
+          }
+        }
+        return count;
+      }
     } else {
       std::size_t count = 0U;
-      std::uint64_t w = 0;
-      while (count < max_count && try_pop_word_fast(w)) {
+      while (count < max_count) {
+        auto item = try_pop_rich_opt();
+        if (!item.has_value()) {
+          break;
+        }
         ++count;
-        if (!invoke_drain_visitor(fn, unpack_word(w))) {
+        if (!invoke_drain_visitor(fn, std::move(*item))) {
           break;
         }
       }
@@ -258,24 +406,36 @@ class RseqLaneEngine {
   }
 
   T pop() noexcept {
-    if constexpr (!kUseRseqLanes) {
+    if constexpr (!kUseAnyRseqLanes) {
       return fallback_.pop();
-    } else {
+    } else if constexpr (kUseWordLanes) {
       std::uint64_t w = 0;
       if (try_pop_word_fast(w)) [[likely]] {
         return unpack_word(w);
       }
       return unpack_word(pop_word_blocking_slow());
+    } else {
+      if (auto item = try_pop_rich_opt(); item.has_value()) [[likely]] {
+        return std::move(*item);
+      }
+      return pop_rich_blocking_slow();
     }
   }
 
   void pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
-    out = pop();
+    if constexpr (kUseRichLanes) {
+      if (try_pop_rich_into(out)) [[likely]] {
+        return;
+      }
+      out = pop_rich_blocking_slow();
+    } else {
+      out = pop();
+    }
   }
 
   [[nodiscard]] std::size_t size() const noexcept {
     std::size_t total = fallback_.size();
-    if constexpr (kUseRseqLanes) {
+    if constexpr (kUseAnyRseqLanes) {
       total += core_.approx_size();
     }
     return total;
@@ -284,6 +444,11 @@ class RseqLaneEngine {
   [[nodiscard]] bool empty() const noexcept { return size() == 0U; }
 
   [[nodiscard]] std::size_t capacity() const noexcept {
+    return lane_cap_fast();
+  }
+
+ private:
+  [[nodiscard]] THETA_FORCE_INLINE std::size_t lane_cap_fast() const noexcept {
     if constexpr (kStaticBufferSize != 0) {
       return kStaticBufferSize;
     } else {
@@ -291,7 +456,257 @@ class RseqLaneEngine {
     }
   }
 
- private:
+  [[nodiscard]] THETA_FORCE_INLINE std::size_t rich_flat_index(
+      std::uint32_t lane, std::uint64_t ticket) const noexcept {
+    const std::size_t cap = lane_cap_fast();
+    return (static_cast<std::size_t>(lane) * cap) +
+           (static_cast<std::size_t>(ticket) & (cap - 1U));
+  }
+
+  template <typename... Args>
+  THETA_FORCE_INLINE bool try_emplace_rich(Args&&... args) noexcept(
+      std::is_nothrow_constructible_v<T, Args...>) {
+    if constexpr (!std::is_nothrow_constructible_v<T, Args...>) {
+      T staged(std::forward<Args>(args)...);
+      return try_emplace_rich_nothrow(std::move(staged));
+    } else {
+      return try_emplace_rich_nothrow(std::forward<Args>(args)...);
+    }
+  }
+
+  template <typename... Args>
+  THETA_FORCE_INLINE bool try_emplace_rich_nothrow(Args&&... args) noexcept {
+    std::uint32_t lane = 0;
+    std::uint64_t ticket = 0;
+    const RseqPushResult res =
+        ArchBackend::try_reserve_rich_slot_rseq(core_, lane, ticket);
+    if (res == RseqPushResult::Pushed) [[likely]] {
+      const std::size_t flat = rich_flat_index(lane, ticket);
+      rich_.storage(flat).construct(std::forward<Args>(args)...);
+      __atomic_store_n(rich_.turn_ptr(flat), (ticket * 2ULL) + 1ULL,
+                       __ATOMIC_RELEASE);
+      cons_park_.notify_if_waiters();
+      return true;
+    }
+    if (res == RseqPushResult::Full) {
+      return false;
+    }
+    return push_rich_overflow_fallback_slow(std::forward<Args>(args)...);
+  }
+
+  THETA_FORCE_INLINE T finish_rich_pop(std::uint32_t lane,
+                                       std::uint64_t ticket) noexcept {
+    const std::size_t cap = lane_cap_fast();
+    const std::size_t flat = rich_flat_index(lane, ticket);
+    T out = rich_.storage(flat).move_and_destroy();
+    __atomic_store_n(rich_.turn_ptr(flat), (ticket + cap) * 2ULL,
+                     __ATOMIC_RELEASE);
+    prod_park_.notify_if_waiters();
+    return out;
+  }
+
+  THETA_FORCE_INLINE void finish_rich_pop_into(
+      std::uint32_t lane, std::uint64_t ticket,
+      T& dst) noexcept(std::is_nothrow_move_assignable_v<T>) {
+    const std::size_t cap = lane_cap_fast();
+    const std::size_t flat = rich_flat_index(lane, ticket);
+    rich_.storage(flat).move_into_and_destroy(dst);
+    __atomic_store_n(rich_.turn_ptr(flat), (ticket + cap) * 2ULL,
+                     __ATOMIC_RELEASE);
+    prod_park_.notify_if_waiters();
+  }
+
+  THETA_FORCE_INLINE std::optional<T> try_pop_rich_opt() noexcept {
+    if constexpr (!kMultiConsumer) {
+      const std::uint8_t cur_idx = core_.sc_cursor;
+      LaneMeta& m = core_.meta[cur_idx];
+      const std::uint64_t h = m.head;
+      if (core_.sc_quantum != 0U) [[likely]] {
+        const std::size_t flat = rich_flat_index(cur_idx, h);
+        if (__atomic_load_n(rich_.turn_ptr(flat), __ATOMIC_ACQUIRE) ==
+            (h * 2ULL) + 1ULL) [[likely]] {
+          --core_.sc_quantum;
+          __atomic_store_n(&m.head, h + 1U, __ATOMIC_RELEASE);
+          return std::optional<T>{finish_rich_pop(cur_idx, h)};
+        }
+      }
+      return try_pop_rich_sc_slow();
+    } else {
+      std::uint32_t lane = 0;
+      std::uint64_t ticket = 0;
+      std::optional<T> fb_out;
+      if (!ArchBackend::try_claim_rich_pop_mc_rseq(
+              core_, lane, ticket,
+              [this, &fb_out](std::uint32_t& l_out,
+                              std::uint64_t& t_out) noexcept {
+                return steal_or_retry_own_rich_opt_slow(l_out, t_out, fb_out);
+              })) {
+        return std::nullopt;
+      }
+      if (lane == UINT32_MAX) [[unlikely]] {
+        return fb_out;
+      }
+      return std::optional<T>{finish_rich_pop(lane, ticket)};
+    }
+  }
+
+  THETA_FORCE_INLINE bool try_pop_rich_into(T& dst) noexcept(
+      std::is_nothrow_move_assignable_v<T>) {
+    if constexpr (!kMultiConsumer) {
+      const std::uint8_t cur_idx = core_.sc_cursor;
+      LaneMeta& m = core_.meta[cur_idx];
+      const std::uint64_t h = m.head;
+      if (core_.sc_quantum != 0U) [[likely]] {
+        const std::size_t flat = rich_flat_index(cur_idx, h);
+        if (__atomic_load_n(rich_.turn_ptr(flat), __ATOMIC_ACQUIRE) ==
+            (h * 2ULL) + 1ULL) [[likely]] {
+          --core_.sc_quantum;
+          __atomic_store_n(&m.head, h + 1U, __ATOMIC_RELEASE);
+          finish_rich_pop_into(cur_idx, h, dst);
+          return true;
+        }
+      }
+      auto slow = try_pop_rich_sc_slow();
+      if (!slow.has_value()) {
+        return false;
+      }
+      dst = std::move(*slow);
+      return true;
+    } else {
+      std::uint32_t lane = 0;
+      std::uint64_t ticket = 0;
+      if (!ArchBackend::try_claim_rich_pop_mc_rseq(
+              core_, lane, ticket,
+              [this, &dst](std::uint32_t& l_out, std::uint64_t& t_out) noexcept(
+                  std::is_nothrow_move_assignable_v<T>) {
+                return steal_or_retry_own_rich_into_slow(l_out, t_out, dst);
+              })) {
+        return false;
+      }
+      if (lane != UINT32_MAX) [[likely]] {
+        finish_rich_pop_into(lane, ticket, dst);
+      }
+      return true;
+    }
+  }
+
+  THETA_ALIGNED_NOINLINE std::optional<T> try_pop_rich_sc_slow() noexcept {
+    const bool quantum_expired = (core_.sc_quantum == 0U);
+    if (quantum_expired &&
+        core_.overflow_ops.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
+      if (auto fb = fallback_.try_pop(); fb.has_value()) {
+        core_.sc_quantum = kRseqScQuantum - 1U;
+        prod_park_.notify_if_waiters();
+        return fb;
+      }
+    }
+
+    const std::uint8_t n_prod = core_.num_prod.load(std::memory_order_acquire);
+    const std::uint8_t limit = n_prod < kMaxRseqPreferred
+                                   ? (n_prod == 0U ? 1U : n_prod)
+                                   : kMaxRseqPreferred;
+    const std::uint8_t start =
+        quantum_expired
+            ? static_cast<std::uint8_t>((core_.sc_cursor + 1U) % limit)
+            : core_.sc_cursor;
+    for (std::uint8_t step = 0; step < limit; ++step) {
+      const auto idx = static_cast<std::uint8_t>((start + step) % limit);
+      LaneMeta& m = core_.meta[idx];
+      const std::uint64_t h = m.head;
+      const std::size_t flat = rich_flat_index(idx, h);
+      if (__atomic_load_n(rich_.turn_ptr(flat), __ATOMIC_ACQUIRE) ==
+          (h * 2ULL) + 1ULL) {
+        core_.sc_cursor = idx;
+        core_.sc_quantum = kRseqScQuantum - 1U;
+        __atomic_store_n(&m.head, h + 1U, __ATOMIC_RELEASE);
+        return std::optional<T>{finish_rich_pop(idx, h)};
+      }
+    }
+    for (std::uint8_t idx = limit; idx < kMaxRseqPreferred; ++idx) {
+      LaneMeta& m = core_.meta[idx];
+      const std::uint64_t h = m.head;
+      const std::size_t flat = rich_flat_index(idx, h);
+      if (__atomic_load_n(rich_.turn_ptr(flat), __ATOMIC_ACQUIRE) ==
+          (h * 2ULL) + 1ULL) {
+        core_.sc_cursor = idx;
+        core_.sc_quantum = kRseqScQuantum - 1U;
+        __atomic_store_n(&m.head, h + 1U, __ATOMIC_RELEASE);
+        return std::optional<T>{finish_rich_pop(idx, h)};
+      }
+    }
+    if (core_.overflow_ops.load(std::memory_order_relaxed) != 0U) {
+      if (auto fb = fallback_.try_pop(); fb.has_value()) {
+        core_.sc_quantum = kRseqScQuantum - 1U;
+        prod_park_.notify_if_waiters();
+        return fb;
+      }
+    }
+    return std::nullopt;
+  }
+
+  template <typename... Args>
+  THETA_ALIGNED_NOINLINE bool push_rich_overflow_fallback_slow(
+      Args&&... args) noexcept {
+    const std::uint32_t ov =
+        core_.overflow_ops.fetch_add(1U, std::memory_order_relaxed) + 1U;
+    if ((ov & 4095U) == 0U) [[unlikely]] {
+      core_.maybe_recycle_prod_cam();
+    }
+    const bool ok = fallback_.try_emplace(std::forward<Args>(args)...);
+    if (ok) {
+      cons_park_.notify_if_waiters();
+    }
+    return ok;
+  }
+
+  THETA_ALIGNED_NOINLINE int steal_or_retry_own_rich_opt_slow(
+      std::uint32_t& out_lane, std::uint64_t& out_ticket,
+      std::optional<T>& fb_out) noexcept {
+    if (core_.overflow_ops.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
+      fb_out = fallback_.try_pop();
+      if (fb_out.has_value()) {
+        out_lane = UINT32_MAX;
+        prod_park_.notify_if_waiters();
+        return 1;
+      }
+    }
+    return core_.try_steal_rich_slot_slow(out_lane, out_ticket);
+  }
+
+  THETA_ALIGNED_NOINLINE int steal_or_retry_own_rich_into_slow(
+      std::uint32_t& out_lane, std::uint64_t& out_ticket,
+      T& dst) noexcept(std::is_nothrow_move_assignable_v<T>) {
+    if (core_.overflow_ops.load(std::memory_order_relaxed) != 0U) [[unlikely]] {
+      if (fallback_.try_pop(dst)) {
+        out_lane = UINT32_MAX;
+        prod_park_.notify_if_waiters();
+        return 1;
+      }
+    }
+    return core_.try_steal_rich_slot_slow(out_lane, out_ticket);
+  }
+
+  THETA_ALIGNED_NOINLINE void push_rich_blocking_slow(T& pending) noexcept {
+    bool pushed = false;
+    prod_park_.wait_until([this, &pending, &pushed]() noexcept {
+      if (!pushed) {
+        pushed = try_emplace_rich_nothrow(std::move(pending));
+      }
+      return pushed;
+    });
+  }
+
+  [[nodiscard]] THETA_ALIGNED_NOINLINE T pop_rich_blocking_slow() noexcept {
+    std::optional<T> out;
+    cons_park_.wait_until([this, &out]() noexcept {
+      if (!out.has_value()) {
+        out = try_pop_rich_opt();
+      }
+      return out.has_value();
+    });
+    return std::move(*out);
+  }
+
   THETA_FORCE_INLINE bool try_push_word_fast(std::uint64_t val) noexcept {
     const RseqPushResult res =
         ArchBackend::try_push_word_rseq(core_, cons_park_, val);
@@ -510,6 +925,8 @@ class RseqLaneEngine {
   }
 
   RseqLaneCore core_{};
+  [[no_unique_address]]
+  std::conditional_t<kUseRichLanes, RichLanePool<T>, EmptyRichLanePool> rich_{};
   FallbackQueue fallback_;
   alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkLot prod_park_;
   AsymmetricParkLot cons_park_;

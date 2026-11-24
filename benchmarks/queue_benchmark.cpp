@@ -1042,6 +1042,24 @@ struct ThetaMPMCGenericAdaptor {
 };
 
 template <typename T>
+struct ThetaFastMPSCGenericAdaptor {
+  using value_type = T;
+  bool try_push(T&& v) { return queue.try_push(std::move(v)); }
+  bool try_pop(T& out) { return queue.try_pop(out); }
+
+  FastMPSCQueue<T, kBenchQueueCapacity> queue{};
+};
+
+template <typename T>
+struct ThetaFastMPMCGenericAdaptor {
+  using value_type = T;
+  bool try_push(T&& v) { return queue.try_push(std::move(v)); }
+  bool try_pop(T& out) { return queue.try_pop(out); }
+
+  FastMPMCQueue<T, kBenchQueueCapacity> queue{};
+};
+
+template <typename T>
 struct ThetaUMPMCGenericAdaptor {
   using value_type = T;
   bool try_push(T&& v) { return queue.try_push(std::move(v)); }
@@ -1255,11 +1273,102 @@ void BM_GenericMPMC4x4_Try(  // NOLINT(readability-identifier-naming)
   state.SetBytesProcessed(items * static_cast<int64_t>(sizeof(T)));
 }
 
+template <typename QType>
+void BM_GenericMPSC4x1_Try(  // NOLINT(readability-identifier-naming)
+    benchmark::State& state) {
+  using T = typename QType::value_type;
+  constexpr int kProducers = 4;
+  constexpr int kTotalThreads = kProducers + 1;
+  QType queue{};
+
+  std::atomic<bool> stop{false};
+  std::barrier ready(kTotalThreads);
+  std::barrier start_batch(kTotalThreads);
+  std::barrier end_batch(kTotalThreads);
+
+  auto push_batch = [&](uint64_t base) {
+    for (std::size_t i = 0; i < kBatchPerProducer; ++i) {
+      T item = make_sample_item<T>(base + i);
+      while (!queue.try_push(std::move(item))) {
+        item = make_sample_item<T>(base + i);
+        cpu_relax();
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(kTotalThreads - 1);
+  for (int p = 1; p < kProducers; ++p) {
+    workers.emplace_back([&, p]() {
+      pin_thread_to_core(p, kTotalThreads);
+      ready.arrive_and_wait();
+      while (true) {
+        start_batch.arrive_and_wait();
+        if (stop.load(std::memory_order::relaxed)) {
+          return;
+        }
+        push_batch(static_cast<uint64_t>(p) << 32U);
+        end_batch.arrive_and_wait();
+      }
+    });
+  }
+  workers.emplace_back([&]() {
+    pin_thread_to_core(kProducers, kTotalThreads);
+    ready.arrive_and_wait();
+    T out{};
+    while (true) {
+      start_batch.arrive_and_wait();
+      if (stop.load(std::memory_order::relaxed)) {
+        return;
+      }
+      for (std::size_t i = 0; i < kBatchPerProducer * kProducers; ++i) {
+        while (!queue.try_pop(out)) {
+          cpu_relax();
+        }
+        benchmark::DoNotOptimize(out);
+      }
+      end_batch.arrive_and_wait();
+    }
+  });
+
+  pin_thread_to_core(0, kTotalThreads);
+  ready.arrive_and_wait();
+  for (auto state_token : state) {
+    benchmark::DoNotOptimize(state_token);
+    start_batch.arrive_and_wait();
+    push_batch(1ULL);
+    end_batch.arrive_and_wait();
+  }
+
+  stop.store(true, std::memory_order::relaxed);
+  start_batch.arrive_and_wait();
+  for (auto& w : workers) {
+    w.join();
+  }
+
+  const auto items =
+      state.iterations() * static_cast<int64_t>(kBatchPerProducer * kProducers);
+  state.SetItemsProcessed(items);
+  state.SetBytesProcessed(items * static_cast<int64_t>(sizeof(T)));
+}
+
 // 64B TriviallyCopyable
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaSPSCGenericAdaptor<Payload64>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaMPMCGenericAdaptor<Payload64>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPSCGenericAdaptor<Payload64>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPMCGenericAdaptor<Payload64>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaUMPMCGenericAdaptor<Payload64>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, ThetaMPMCGenericAdaptor<Payload64>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try,
+                   ThetaFastMPSCGenericAdaptor<Payload64>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaMPMCGenericAdaptor<Payload64>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try,
+                   ThetaFastMPMCGenericAdaptor<Payload64>)
     ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaUMPMCGenericAdaptor<Payload64>)
     ->UseRealTime();
@@ -1272,6 +1381,8 @@ BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, AtomicQueue2GenericAdaptor<Payload64>)
 #if defined(THETA_QUEUE_HAS_FOLLY)
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollyMPMCGenericAdaptor<Payload64>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollySPSCGenericAdaptor<Payload64>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, FollyMPMCGenericAdaptor<Payload64>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, FollyMPMCGenericAdaptor<Payload64>)
     ->UseRealTime();
 #endif
@@ -1289,8 +1400,20 @@ BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaMutexGenericAdaptor<Payload64>)
 // 256B TriviallyCopyable
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaSPSCGenericAdaptor<Payload256>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaMPMCGenericAdaptor<Payload256>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPSCGenericAdaptor<Payload256>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPMCGenericAdaptor<Payload256>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaUMPMCGenericAdaptor<Payload256>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, ThetaMPMCGenericAdaptor<Payload256>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try,
+                   ThetaFastMPSCGenericAdaptor<Payload256>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaMPMCGenericAdaptor<Payload256>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try,
+                   ThetaFastMPMCGenericAdaptor<Payload256>)
     ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaUMPMCGenericAdaptor<Payload256>)
     ->UseRealTime();
@@ -1304,6 +1427,8 @@ BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try,
 #if defined(THETA_QUEUE_HAS_FOLLY)
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollyMPMCGenericAdaptor<Payload256>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollySPSCGenericAdaptor<Payload256>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, FollyMPMCGenericAdaptor<Payload256>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, FollyMPMCGenericAdaptor<Payload256>)
     ->UseRealTime();
 #endif
@@ -1321,14 +1446,28 @@ BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaMutexGenericAdaptor<Payload256>)
 // 32B Move-Only Non-Trivial (MoveOnly32)
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaSPSCGenericAdaptor<MoveOnly32>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaMPMCGenericAdaptor<MoveOnly32>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPSCGenericAdaptor<MoveOnly32>);
+BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip,
+                   ThetaFastMPMCGenericAdaptor<MoveOnly32>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, ThetaUMPMCGenericAdaptor<MoveOnly32>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, ThetaMPMCGenericAdaptor<MoveOnly32>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try,
+                   ThetaFastMPSCGenericAdaptor<MoveOnly32>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaMPMCGenericAdaptor<MoveOnly32>)
+    ->UseRealTime();
+BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try,
+                   ThetaFastMPMCGenericAdaptor<MoveOnly32>)
     ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, ThetaUMPMCGenericAdaptor<MoveOnly32>)
     ->UseRealTime();
 #if defined(THETA_QUEUE_HAS_FOLLY)
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollyMPMCGenericAdaptor<MoveOnly32>);
 BENCHMARK_TEMPLATE(BM_Generic1TRoundtrip, FollySPSCGenericAdaptor<MoveOnly32>);
+BENCHMARK_TEMPLATE(BM_GenericMPSC4x1_Try, FollyMPMCGenericAdaptor<MoveOnly32>)
+    ->UseRealTime();
 BENCHMARK_TEMPLATE(BM_GenericMPMC4x4_Try, FollyMPMCGenericAdaptor<MoveOnly32>)
     ->UseRealTime();
 #endif

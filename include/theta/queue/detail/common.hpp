@@ -322,6 +322,11 @@ static_assert(offsetof(LaneMeta, data_cons) == 144);
 static_assert(offsetof(LaneMeta, mask_cons) == 152);
 static_assert(offsetof(LaneMeta, cons_exclusive) == 160);
 
+struct alignas(64) RichTurnLine {
+  std::uint64_t turn{0};
+};
+static_assert(sizeof(RichTurnLine) == 64);
+
 // Type-erased 2-Tier `rseq` + 7-Slot CAM state block; cold slot assignment,
 // quiescent CAM recycling (`MEMBARRIER_RSEQ`), and work-stealing state
 // transitions live out-of-line in `src/queue.cpp`.
@@ -348,6 +353,8 @@ struct RseqLaneCore {
   std::array<LaneMeta, kMaxRseqPreferred> meta{};
 
   void init(std::size_t cap, bool multi_consumer);
+  void init_rich_turns(std::size_t cap, bool multi_consumer,
+                       std::uint64_t* base_turn_ptr) noexcept;
   void destroy() noexcept;
   [[nodiscard]] std::size_t approx_size() const noexcept;
 
@@ -356,6 +363,8 @@ struct RseqLaneCore {
   [[gnu::cold]] void maybe_recycle_prod_cam() noexcept;
   [[gnu::cold]] bool try_assign_cons_slot_slow() noexcept;
   [[gnu::cold]] int try_steal_lane_word_slow(std::uint64_t& out) noexcept;
+  [[gnu::cold]] int try_steal_rich_slot_slow(
+      std::uint32_t& out_lane, std::uint64_t& out_ticket) noexcept;
 };
 
 // Page-local cache-line index permutation: swaps low `kBits` [0..kBits-1] with

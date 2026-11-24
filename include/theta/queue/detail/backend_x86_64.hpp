@@ -364,6 +364,276 @@ struct ArchBackend {
     }
     return steal_fn(out) > 0;
   }
+
+  static THETA_FORCE_INLINE RseqPushResult
+  try_reserve_rich_slot_rseq(RseqLaneCore& core, std::uint32_t& out_lane,
+                             std::uint64_t& out_ticket) noexcept {
+    const std::ptrdiff_t rseq_off = __rseq_offset;
+
+  retry_rich_push:
+    {
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_t = 0;
+      std::uint64_t next_t = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-1 biased slot-index
+      // reservation (64B-strided turn check + tail commit; payload constructed
+      // outside `[2f, 3f)`).
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "leaq 1b(%%rip), %[tmp]\n\t"
+          "movq %[tmp], %%fs:8(%[rseq_off])\n\t"
+          "2:\n\t"
+          "cmpb $0, (%[biased])\n\t"
+          "je %l[tier2_rich_push]\n\t"
+          "movl %%fs:4(%[rseq_off]), %k[tmp]\n\t"
+          "movzwl 2(%[cam]), %k[slot]\n\t"
+          "incl %k[tmp]\n\t"
+          "cmpl %k[slot], %k[tmp]\n\t"
+          "jne %l[slow_rich_push]\n\t"
+          "movq (%[meta]), %[cur_t]\n\t"
+          "leaq (%[cur_t], %[cur_t]), %[next_t]\n\t"
+          "movq %[cur_t], %[tmp]\n\t"
+          "andq 32(%[meta]), %[tmp]\n\t"
+          "shlq $6, %[tmp]\n\t"
+          "addq 16(%[meta]), %[tmp]\n\t"
+          "cmpq %[next_t], (%[tmp])\n\t"
+          "jne %l[full_rich_push]\n\t"
+          "incq %[cur_t]\n\t"
+          "movq %[cur_t], (%[meta])\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".long 0x53053053\n\t"
+          "4:\n\t"
+          "jmp 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_t] "=&r"(cur_t),
+            [next_t] "=&r"(next_t)
+          : [rseq_off] "r"(rseq_off), [biased] "r"(&core.prod_biased),
+            [cam] "r"(core.prod_cam.data()), [meta] "r"(core.meta.data())
+          : "memory", "cc"
+          : tier2_rich_push, full_rich_push, slow_rich_push);
+      out_lane = 0U;
+      out_ticket = cur_t - 1U;
+      return RseqPushResult::Pushed;
+    }
+
+  tier2_rich_push:
+    {
+      __m128i v_cpu{};  // NOLINT(misc-const-correctness)
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_t = 0;
+      std::uint64_t next_t = 0;
+      std::uintptr_t lp = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-2 7-slot SSE2 CAM
+      // slot-index reservation inside `[2f, 3f)`.
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "leaq 1b(%%rip), %[tmp]\n\t"
+          "movq %[tmp], %%fs:8(%[rseq_off])\n\t"
+          "2:\n\t"
+          "movl %%fs:4(%[rseq_off]), %k[tmp]\n\t"
+          "cmpl $8192, %k[tmp]\n\t"
+          "jae %l[slow_rich_push]\n\t"
+          "incl %k[tmp]\n\t"
+          "movd %k[tmp], %[v]\n\t"
+          "pshuflw $0, %[v], %[v]\n\t"
+          "punpcklqdq %[v], %[v]\n\t"
+          "pcmpeqw (%[cam]), %[v]\n\t"
+          "pmovmskb %[v], %k[slot]\n\t"
+          "bsfl %k[slot], %k[slot]\n\t"
+          "je %l[slow_rich_push]\n\t"
+          "shrl $1, %k[slot]\n\t"
+          "leaq -1(%[slot]), %[tmp]\n\t"
+          "shlq $8, %[tmp]\n\t"
+          "leaq (%[meta], %[tmp], 1), %[lp]\n\t"
+          "movq (%[lp]), %[cur_t]\n\t"
+          "leaq (%[cur_t], %[cur_t]), %[next_t]\n\t"
+          "movq %[cur_t], %[tmp]\n\t"
+          "andq 32(%[lp]), %[tmp]\n\t"
+          "shlq $6, %[tmp]\n\t"
+          "addq 16(%[lp]), %[tmp]\n\t"
+          "cmpq %[next_t], (%[tmp])\n\t"
+          "jne %l[full_rich_push]\n\t"
+          "incq %[cur_t]\n\t"
+          "movq %[cur_t], (%[lp])\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".long 0x53053053\n\t"
+          "4:\n\t"
+          "jmp 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_t] "=&r"(cur_t),
+            [next_t] "=&r"(next_t), [lp] "=&r"(lp), [v] "=&x"(v_cpu)
+          : [rseq_off] "r"(rseq_off), [cam] "r"(core.prod_cam.data()),
+            [meta] "r"(core.meta.data())
+          : "memory", "cc"
+          : full_rich_push, slow_rich_push);
+      out_lane = static_cast<std::uint32_t>(slot - 1U);
+      out_ticket = cur_t - 1U;
+      return RseqPushResult::Pushed;
+    }
+
+  full_rich_push:
+    return RseqPushResult::Full;
+  slow_rich_push:
+    if (core.try_assign_prod_slot_slow()) {
+      goto retry_rich_push;
+    }
+    return RseqPushResult::Overflow;
+  }
+
+  template <typename StealFn>
+  static THETA_FORCE_INLINE bool try_claim_rich_pop_mc_rseq(
+      RseqLaneCore& core, std::uint32_t& out_lane, std::uint64_t& out_ticket,
+      StealFn&& steal_fn) noexcept {
+    const std::ptrdiff_t rseq_off = __rseq_offset;
+
+  retry_rich_pop:
+    {
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_h = 0;
+      std::uint64_t next_h = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-1 biased consumer
+      // slot-index claim inside `[2f, 3f)` (payload moved outside `rseq`).
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "leaq 1b(%%rip), %[tmp]\n\t"
+          "movq %[tmp], %%fs:8(%[rseq_off])\n\t"
+          "2:\n\t"
+          "cmpb $0, (%[biased])\n\t"
+          "je %l[tier2_rich_pop]\n\t"
+          "movl %%fs:4(%[rseq_off]), %k[tmp]\n\t"
+          "movzwl 2(%[cam]), %k[slot]\n\t"
+          "incl %k[tmp]\n\t"
+          "cmpl %k[slot], %k[tmp]\n\t"
+          "jne %l[slow_rich_pop]\n\t"
+          "movq 128(%[meta]), %[cur_h]\n\t"
+          "leaq 1(%[cur_h], %[cur_h]), %[next_h]\n\t"
+          "movq %[cur_h], %[tmp]\n\t"
+          "andq 152(%[meta]), %[tmp]\n\t"
+          "shlq $6, %[tmp]\n\t"
+          "addq 144(%[meta]), %[tmp]\n\t"
+          "cmpq %[next_h], (%[tmp])\n\t"
+          "jne %l[steal_rich_pop]\n\t"
+          "incq %[cur_h]\n\t"
+          "movq %[cur_h], 128(%[meta])\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".long 0x53053053\n\t"
+          "4:\n\t"
+          "jmp 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_h] "=&r"(cur_h),
+            [next_h] "=&r"(next_h)
+          : [rseq_off] "r"(rseq_off), [biased] "r"(&core.cons_biased),
+            [cam] "r"(core.cons_cam.data()), [meta] "r"(core.meta.data())
+          : "memory", "cc"
+          : tier2_rich_pop, steal_rich_pop, slow_rich_pop);
+      out_lane = 0U;
+      out_ticket = cur_h - 1U;
+      return true;
+    }
+
+  tier2_rich_pop:
+    {
+      __m128i v_cpu{};  // NOLINT(misc-const-correctness)
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_h = 0;
+      std::uint64_t next_h = 0;
+      std::uintptr_t lp = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-2 7-slot SSE2 CAM
+      // consumer slot-index claim inside `[2f, 3f)`.
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "leaq 1b(%%rip), %[tmp]\n\t"
+          "movq %[tmp], %%fs:8(%[rseq_off])\n\t"
+          "2:\n\t"
+          "movl %%fs:4(%[rseq_off]), %k[tmp]\n\t"
+          "cmpl $8192, %k[tmp]\n\t"
+          "jae %l[slow_rich_pop]\n\t"
+          "incl %k[tmp]\n\t"
+          "movd %k[tmp], %[v]\n\t"
+          "pshuflw $0, %[v], %[v]\n\t"
+          "punpcklqdq %[v], %[v]\n\t"
+          "pcmpeqw (%[cam]), %[v]\n\t"
+          "pmovmskb %[v], %k[slot]\n\t"
+          "bsfl %k[slot], %k[slot]\n\t"
+          "je %l[slow_rich_pop]\n\t"
+          "shrl $1, %k[slot]\n\t"
+          "leaq -1(%[slot]), %[tmp]\n\t"
+          "shlq $8, %[tmp]\n\t"
+          "leaq (%[meta], %[tmp], 1), %[lp]\n\t"
+          "cmpb $0, 160(%[lp])\n\t"
+          "je %l[steal_rich_pop]\n\t"
+          "movq 128(%[lp]), %[cur_h]\n\t"
+          "leaq 1(%[cur_h], %[cur_h]), %[next_h]\n\t"
+          "movq %[cur_h], %[tmp]\n\t"
+          "andq 152(%[lp]), %[tmp]\n\t"
+          "shlq $6, %[tmp]\n\t"
+          "addq 144(%[lp]), %[tmp]\n\t"
+          "cmpq %[next_h], (%[tmp])\n\t"
+          "jne %l[steal_rich_pop]\n\t"
+          "incq %[cur_h]\n\t"
+          "movq %[cur_h], 128(%[lp])\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".long 0x53053053\n\t"
+          "4:\n\t"
+          "jmp 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_h] "=&r"(cur_h),
+            [next_h] "=&r"(next_h), [lp] "=&r"(lp), [v] "=&x"(v_cpu)
+          : [rseq_off] "r"(rseq_off), [cam] "r"(core.cons_cam.data()),
+            [meta] "r"(core.meta.data())
+          : "memory", "cc"
+          : steal_rich_pop, slow_rich_pop);
+      out_lane = static_cast<std::uint32_t>(slot - 1U);
+      out_ticket = cur_h - 1U;
+      return true;
+    }
+
+  steal_rich_pop:
+    {
+      const int st = steal_fn(out_lane, out_ticket);
+      if (st < 0) {
+        goto retry_rich_pop;
+      }
+      return st > 0;
+    }
+  slow_rich_pop:
+    if (core.try_assign_cons_slot_slow()) {
+      goto retry_rich_pop;
+    }
+    return steal_fn(out_lane, out_ticket) > 0;
+  }
 #else
   static RseqPushResult try_push_word_rseq(RseqLaneCore& /*core*/,
                                            AsymmetricParkLot& /*cons_park*/,
@@ -376,6 +646,20 @@ struct ArchBackend {
                                    AsymmetricParkLot& /*prod_park*/,
                                    std::uint64_t& /*out*/,
                                    StealFn&& /*steal_fn*/) noexcept {
+    return false;
+  }
+
+  static RseqPushResult try_reserve_rich_slot_rseq(
+      RseqLaneCore& /*core*/, std::uint32_t& /*out_lane*/,
+      std::uint64_t& /*out_ticket*/) noexcept {
+    return RseqPushResult::Overflow;
+  }
+
+  template <typename StealFn>
+  static bool try_claim_rich_pop_mc_rseq(RseqLaneCore& /*core*/,
+                                         std::uint32_t& /*out_lane*/,
+                                         std::uint64_t& /*out_ticket*/,
+                                         StealFn&& /*steal_fn*/) noexcept {
     return false;
   }
 #endif

@@ -40,6 +40,20 @@ struct ArchBackend {
                                    StealFn&& /*steal_fn*/) noexcept {
     return false;
   }
+
+  static RseqPushResult try_reserve_rich_slot_rseq(
+      RseqLaneCore& /*core*/, std::uint32_t& /*out_lane*/,
+      std::uint64_t& /*out_ticket*/) noexcept {
+    return RseqPushResult::Overflow;
+  }
+
+  template <typename StealFn>
+  static bool try_claim_rich_pop_mc_rseq(RseqLaneCore& /*core*/,
+                                         std::uint32_t& /*out_lane*/,
+                                         std::uint64_t& /*out_ticket*/,
+                                         StealFn&& /*steal_fn*/) noexcept {
+    return false;
+  }
 };
 
 }  // namespace theta::queue::detail

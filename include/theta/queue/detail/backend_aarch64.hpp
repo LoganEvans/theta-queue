@@ -402,6 +402,298 @@ struct ArchBackend {
     }
     return steal_fn(out) > 0;
   }
+
+  static THETA_FORCE_INLINE RseqPushResult
+  try_reserve_rich_slot_rseq(RseqLaneCore& core, std::uint32_t& out_lane,
+                             std::uint64_t& out_ticket) noexcept {
+    const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
+    const char* const rseq_base = tp + __rseq_offset;
+
+  retry_rich_push:
+    if (__atomic_load_n(&core.prod_biased, __ATOMIC_RELAXED) != 0U) [[likely]] {
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_t = 0;
+      std::uint64_t next_t = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-1 biased AArch64
+      // `rseq` slot-index reservation with `ldar` turn acquire and `stlr` tail
+      // commit (`[2f, 3f)`, payload constructed outside `rseq`).
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "adrp %[tmp], 1b\n\t"
+          "add %[tmp], %[tmp], :lo12:1b\n\t"
+          "str %[tmp], [%[rseq], #8]\n\t"
+          "2:\n\t"
+          "ldrb %w[tmp], [%[biased]]\n\t"
+          "cbz %w[tmp], %l[tier2_rich_push]\n\t"
+          "ldr %w[tmp], [%[rseq], #4]\n\t"
+          "ldrh %w[slot], [%[cam], #2]\n\t"
+          "add %w[tmp], %w[tmp], #1\n\t"
+          "cmp %w[tmp], %w[slot]\n\t"
+          "b.ne %l[slow_rich_push]\n\t"
+          "ldr %[cur_t], [%[meta]]\n\t"
+          "ldr %[tmp], [%[meta], #32]\n\t"
+          "and %[next_t], %[cur_t], %[tmp]\n\t"
+          "ldr %[tmp], [%[meta], #16]\n\t"
+          "add %[tmp], %[tmp], %[next_t], lsl #6\n\t"
+          "ldar %[tmp], [%[tmp]]\n\t"
+          "cmp %[tmp], %[cur_t], lsl #1\n\t"
+          "b.ne %l[full_rich_push]\n\t"
+          "add %[next_t], %[cur_t], #1\n\t"
+          "stlr %[next_t], [%[meta]]\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".inst 0xd428bc00\n\t"
+          "4:\n\t"
+          "b 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_t] "=&r"(cur_t),
+            [next_t] "=&r"(next_t)
+          : [rseq] "r"(rseq_base), [biased] "r"(&core.prod_biased),
+            [cam] "r"(core.prod_cam.data()), [meta] "r"(core.meta.data())
+          : "memory", "cc"
+          : tier2_rich_push, full_rich_push, slow_rich_push);
+      out_lane = 0U;
+      out_ticket = cur_t;
+      return RseqPushResult::Pushed;
+    }
+
+  tier2_rich_push:
+    for (int mig = 0; mig < 2; ++mig) {
+      const std::int32_t approx_cpu =
+          __atomic_load_n(reinterpret_cast<const std::int32_t*>(rseq_base + 4),
+                          __ATOMIC_RELAXED);
+      if (approx_cpu < 0 || approx_cpu >= kMaxTrackedQueueCpus) [[unlikely]] {
+        goto slow_rich_push;
+      }
+      const std::uint32_t slot_u32 = find_cam_slot_fast(
+          core.prod_cam.data(), static_cast<std::uint16_t>(approx_cpu + 1));
+      if (slot_u32 == 0U) {
+        goto slow_rich_push;
+      }
+      const auto slot_idx = static_cast<std::uint64_t>(slot_u32);
+      LaneMeta* const lp = &core.meta[slot_u32 - 1U];
+      std::uint64_t tmp = 0;
+      std::uint64_t chk = 0;
+      std::uint64_t cur_t = 0;
+      std::uint64_t next_t = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-2 7-slot CAM AArch64
+      // `rseq` slot-index reservation inside `[2f, 3f)`.
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "adrp %[tmp], 1b\n\t"
+          "add %[tmp], %[tmp], :lo12:1b\n\t"
+          "str %[tmp], [%[rseq], #8]\n\t"
+          "2:\n\t"
+          "ldr %w[tmp], [%[rseq], #4]\n\t"
+          "add %w[tmp], %w[tmp], #1\n\t"
+          "ldrh %w[chk], [%[cam], %[slot], lsl #1]\n\t"
+          "cmp %w[tmp], %w[chk]\n\t"
+          "b.ne %l[recheck_rich_push]\n\t"
+          "ldr %[cur_t], [%[lp]]\n\t"
+          "ldr %[tmp], [%[lp], #32]\n\t"
+          "and %[next_t], %[cur_t], %[tmp]\n\t"
+          "ldr %[tmp], [%[lp], #16]\n\t"
+          "add %[tmp], %[tmp], %[next_t], lsl #6\n\t"
+          "ldar %[tmp], [%[tmp]]\n\t"
+          "cmp %[tmp], %[cur_t], lsl #1\n\t"
+          "b.ne %l[full_rich_push]\n\t"
+          "add %[next_t], %[cur_t], #1\n\t"
+          "stlr %[next_t], [%[lp]]\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".inst 0xd428bc00\n\t"
+          "4:\n\t"
+          "b 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [chk] "=&r"(chk), [cur_t] "=&r"(cur_t),
+            [next_t] "=&r"(next_t)
+          : [rseq] "r"(rseq_base), [cam] "r"(core.prod_cam.data()),
+            [slot] "r"(slot_idx), [lp] "r"(lp)
+          : "memory", "cc"
+          : recheck_rich_push, full_rich_push);
+      out_lane = slot_u32 - 1U;
+      out_ticket = cur_t;
+      return RseqPushResult::Pushed;
+    recheck_rich_push:;
+    }
+    goto slow_rich_push;
+
+  full_rich_push:
+    return RseqPushResult::Full;
+  slow_rich_push:
+    if (core.try_assign_prod_slot_slow()) {
+      goto retry_rich_push;
+    }
+    return RseqPushResult::Overflow;
+  }
+
+  template <typename StealFn>
+  static THETA_FORCE_INLINE bool try_claim_rich_pop_mc_rseq(
+      RseqLaneCore& core, std::uint32_t& out_lane, std::uint64_t& out_ticket,
+      StealFn&& steal_fn) noexcept {
+    const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
+    const char* const rseq_base = tp + __rseq_offset;
+
+  retry_rich_pop:
+    if (__atomic_load_n(&core.cons_biased, __ATOMIC_RELAXED) != 0U) [[likely]] {
+      LaneMeta* const meta0 = core.meta.data();
+      std::uint64_t* const head0 = &meta0->head;
+      std::uint64_t tmp = 0;
+      std::uint64_t slot = 0;
+      std::uint64_t cur_h = 0;
+      std::uint64_t next_h = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-1 biased consumer
+      // AArch64 `rseq` slot-index claim with `ldar` turn acquire and `stlr`
+      // head commit (`[2f, 3f)`).
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "adrp %[tmp], 1b\n\t"
+          "add %[tmp], %[tmp], :lo12:1b\n\t"
+          "str %[tmp], [%[rseq], #8]\n\t"
+          "2:\n\t"
+          "ldarb %w[tmp], [%[biased]]\n\t"
+          "cbz %w[tmp], %l[tier2_rich_pop]\n\t"
+          "ldr %w[tmp], [%[rseq], #4]\n\t"
+          "ldrh %w[slot], [%[cam], #2]\n\t"
+          "add %w[tmp], %w[tmp], #1\n\t"
+          "cmp %w[tmp], %w[slot]\n\t"
+          "b.ne %l[slow_rich_pop]\n\t"
+          "ldr %[cur_h], [%[head]]\n\t"
+          "ldr %[tmp], [%[meta], #152]\n\t"
+          "and %[next_h], %[cur_h], %[tmp]\n\t"
+          "ldr %[tmp], [%[meta], #144]\n\t"
+          "add %[tmp], %[tmp], %[next_h], lsl #6\n\t"
+          "ldar %[tmp], [%[tmp]]\n\t"
+          "lsl %[next_h], %[cur_h], #1\n\t"
+          "orr %[next_h], %[next_h], #1\n\t"
+          "cmp %[tmp], %[next_h]\n\t"
+          "b.ne %l[steal_rich_pop]\n\t"
+          "add %[next_h], %[cur_h], #1\n\t"
+          "stlr %[next_h], [%[head]]\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".inst 0xd428bc00\n\t"
+          "4:\n\t"
+          "b 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [slot] "=&r"(slot), [cur_h] "=&r"(cur_h),
+            [next_h] "=&r"(next_h)
+          : [rseq] "r"(rseq_base), [biased] "r"(&core.cons_biased),
+            [cam] "r"(core.cons_cam.data()), [meta] "r"(meta0),
+            [head] "r"(head0)
+          : "memory", "cc"
+          : tier2_rich_pop, steal_rich_pop, slow_rich_pop);
+      out_lane = 0U;
+      out_ticket = cur_h;
+      return true;
+    }
+
+  tier2_rich_pop:
+    for (int mig = 0; mig < 2; ++mig) {
+      const std::int32_t approx_cpu =
+          __atomic_load_n(reinterpret_cast<const std::int32_t*>(rseq_base + 4),
+                          __ATOMIC_RELAXED);
+      if (approx_cpu < 0 || approx_cpu >= kMaxTrackedQueueCpus) [[unlikely]] {
+        goto slow_rich_pop;
+      }
+      const std::uint32_t slot_u32 = find_cam_slot_fast(
+          core.cons_cam.data(), static_cast<std::uint16_t>(approx_cpu + 1));
+      if (slot_u32 == 0U) {
+        goto slow_rich_pop;
+      }
+      const auto slot_idx = static_cast<std::uint64_t>(slot_u32);
+      LaneMeta* const lp = &core.meta[slot_u32 - 1U];
+      std::uint64_t* const head_ptr = &lp->head;
+      std::uint64_t tmp = 0;
+      std::uint64_t chk = 0;
+      std::uint64_t cur_h = 0;
+      std::uint64_t next_h = 0;
+      // WHY ASM: (a) OS/ABI control-flow contract — Tier-2 7-slot CAM consumer
+      // AArch64 `rseq` slot-index claim inside `[2f, 3f)`.
+      asm volatile goto(
+          ".pushsection __rseq_cs, \"aw?\"\n\t"
+          ".balign 32\n\t"
+          "1:\n\t"
+          ".long 0, 0\n\t"
+          ".quad 2f, (3f - 2f), 4f\n\t"
+          ".popsection\n\t"
+          "6:\n\t"
+          "adrp %[tmp], 1b\n\t"
+          "add %[tmp], %[tmp], :lo12:1b\n\t"
+          "str %[tmp], [%[rseq], #8]\n\t"
+          "2:\n\t"
+          "ldr %w[tmp], [%[rseq], #4]\n\t"
+          "add %w[tmp], %w[tmp], #1\n\t"
+          "ldrh %w[chk], [%[cam], %[slot], lsl #1]\n\t"
+          "cmp %w[tmp], %w[chk]\n\t"
+          "b.ne %l[recheck_rich_pop]\n\t"
+          "ldarb %w[tmp], [%[ex]]\n\t"
+          "cbz %w[tmp], %l[steal_rich_pop]\n\t"
+          "ldr %[cur_h], [%[head]]\n\t"
+          "ldr %[tmp], [%[lp], #152]\n\t"
+          "and %[next_h], %[cur_h], %[tmp]\n\t"
+          "ldr %[tmp], [%[lp], #144]\n\t"
+          "add %[tmp], %[tmp], %[next_h], lsl #6\n\t"
+          "ldar %[tmp], [%[tmp]]\n\t"
+          "lsl %[next_h], %[cur_h], #1\n\t"
+          "orr %[next_h], %[next_h], #1\n\t"
+          "cmp %[tmp], %[next_h]\n\t"
+          "b.ne %l[steal_rich_pop]\n\t"
+          "add %[next_h], %[cur_h], #1\n\t"
+          "stlr %[next_h], [%[head]]\n\t"
+          "3:\n\t"
+          ".pushsection .text.unlikely, \"ax?\"\n\t"
+          ".inst 0xd428bc00\n\t"
+          "4:\n\t"
+          "b 6b\n\t"
+          ".popsection\n\t"
+          : [tmp] "=&r"(tmp), [chk] "=&r"(chk), [cur_h] "=&r"(cur_h),
+            [next_h] "=&r"(next_h)
+          : [rseq] "r"(rseq_base), [cam] "r"(core.cons_cam.data()),
+            [slot] "r"(slot_idx), [lp] "r"(lp), [head] "r"(head_ptr),
+            [ex] "r"(&lp->cons_exclusive)
+          : "memory", "cc"
+          : recheck_rich_pop, steal_rich_pop);
+      out_lane = slot_u32 - 1U;
+      out_ticket = cur_h;
+      return true;
+    recheck_rich_pop:;
+    }
+    goto slow_rich_pop;
+
+  steal_rich_pop:
+    {
+      const int st = steal_fn(out_lane, out_ticket);
+      if (st < 0) {
+        goto retry_rich_pop;
+      }
+      return st > 0;
+    }
+  slow_rich_pop:
+    if (core.try_assign_cons_slot_slow()) {
+      goto retry_rich_pop;
+    }
+    return steal_fn(out_lane, out_ticket) > 0;
+  }
 #else
   static RseqPushResult try_push_word_rseq(RseqLaneCore& /*core*/,
                                            AsymmetricParkLot& /*cons_park*/,
@@ -414,6 +706,20 @@ struct ArchBackend {
                                    AsymmetricParkLot& /*prod_park*/,
                                    std::uint64_t& /*out*/,
                                    StealFn&& /*steal_fn*/) noexcept {
+    return false;
+  }
+
+  static RseqPushResult try_reserve_rich_slot_rseq(
+      RseqLaneCore& /*core*/, std::uint32_t& /*out_lane*/,
+      std::uint64_t& /*out_ticket*/) noexcept {
+    return RseqPushResult::Overflow;
+  }
+
+  template <typename StealFn>
+  static bool try_claim_rich_pop_mc_rseq(RseqLaneCore& /*core*/,
+                                         std::uint32_t& /*out_lane*/,
+                                         std::uint64_t& /*out_ticket*/,
+                                         StealFn&& /*steal_fn*/) noexcept {
     return false;
   }
 #endif
