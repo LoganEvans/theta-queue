@@ -967,6 +967,42 @@ TEST(BulkAndDrainTest, SPSC_CrossThreadBulkStreamingAndMoveOnlyDrain) {
     EXPECT_EQ(live.load(), 15);
   }
   EXPECT_EQ(live.load(), 0);
+
+  // Verify zero-copy `drain` and early-stopping visitor on `FastMPSCQueue` and
+  // `FastMPMCQueue` out-of-`rseq` `RichLanePool<TrackedMoveOnly>`.
+  auto verify_rich_rseq_drain = [&](auto& rq) {
+    for (uint64_t i = 1; i <= 40; ++i) {
+      ASSERT_TRUE(rq.try_emplace(&live, i));
+    }
+    EXPECT_EQ(live.load(), 40);
+
+    uint64_t acc = 0;
+    std::size_t seen = 0;
+    const std::size_t n1 = rq.drain([&](TrackedMoveOnly&& item) noexcept {
+      acc += item.value();
+      ++seen;
+      return seen < 15U;
+    });
+    EXPECT_EQ(n1, 15U);
+    EXPECT_EQ(live.load(), 25);
+
+    const std::size_t n2 = rq.drain(
+        [&](TrackedMoveOnly&& item) noexcept { acc += item.value(); }, 10U);
+    EXPECT_EQ(n2, 10U);
+    EXPECT_EQ(live.load(), 15);
+
+    const std::size_t n3 =
+        rq.drain([&](TrackedMoveOnly&& item) noexcept { acc += item.value(); });
+    EXPECT_EQ(n3, 15U);
+    EXPECT_EQ(acc, (40U * 41U) / 2U);
+    EXPECT_EQ(live.load(), 0);
+    EXPECT_TRUE(rq.empty());
+  };
+
+  FastMPSCQueue<TrackedMoveOnly, 64> fast_mpsc_move;
+  FastMPMCQueue<TrackedMoveOnly, 64> fast_mpmc_move;
+  verify_rich_rseq_drain(fast_mpsc_move);
+  verify_rich_rseq_drain(fast_mpmc_move);
 }
 
 TEST(ConventionsAndPeerTest, MultiTuOdrAndTwoTierStateTransitions) {

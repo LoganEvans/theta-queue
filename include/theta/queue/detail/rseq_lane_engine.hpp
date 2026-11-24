@@ -390,18 +390,11 @@ class RseqLaneEngine {
         return count;
       }
     } else {
-      std::size_t count = 0U;
-      while (count < max_count) {
-        auto item = try_pop_rich_opt();
-        if (!item.has_value()) {
-          break;
-        }
-        ++count;
-        if (!invoke_drain_visitor(fn, std::move(*item))) {
-          break;
-        }
+      if constexpr (!kMultiConsumer) {
+        return drain_rich_sc(fn, max_count);
+      } else {
+        return drain_rich_mc(fn, max_count);
       }
-      return count;
     }
   }
 
@@ -867,6 +860,123 @@ class RseqLaneEngine {
       total += fb_n;
     }
     return total;
+  }
+
+  template <typename Func>
+  std::size_t drain_rich_sc(Func& fn, std::size_t max_count) noexcept(
+      std::is_nothrow_invocable_v<Func&, T&&>) {
+    if (max_count == 0U) {
+      return 0U;
+    }
+    const std::size_t cap = lane_cap_fast();
+    std::size_t total = 0U;
+    bool keep_going = true;
+    for (std::uint8_t step = 0;
+         step < kMaxRseqPreferred && keep_going && total < max_count; ++step) {
+      const auto idx = static_cast<std::uint8_t>((core_.sc_cursor + step) %
+                                                 kMaxRseqPreferred);
+      LaneMeta& m = core_.meta[idx];
+      const std::uint64_t h = m.head;
+      const std::size_t max_lane = max_count - total;
+      std::size_t consumed = 0U;
+      const struct LaneCommitGuard {
+        RseqLaneEngine* self;
+        LaneMeta* meta;
+        std::uint64_t start_h;
+        std::size_t* count;
+        ~LaneCommitGuard() noexcept {
+          if (*count > 0U) {
+            __atomic_store_n(&meta->head, start_h + *count, __ATOMIC_RELEASE);
+            self->prod_park_.notify_if_waiters();
+          }
+        }
+      } lane_guard{this, &m, h, &consumed};
+
+      while (consumed < max_lane) {
+        const std::uint64_t p_idx = h + consumed;
+        const std::size_t flat = rich_flat_index(idx, p_idx);
+        if (__atomic_load_n(rich_.turn_ptr(flat), __ATOMIC_ACQUIRE) !=
+            (p_idx * 2ULL) + 1ULL) {
+          break;
+        }
+        ++consumed;
+        const struct RichSlotCleanup {
+          T* ptr;
+          std::uint64_t* turn_p;
+          std::uint64_t next_turn;
+          ~RichSlotCleanup() noexcept {
+            std::destroy_at(ptr);
+            __atomic_store_n(turn_p, next_turn, __ATOMIC_RELEASE);
+          }
+        } slot_cleanup{rich_.storage(flat).ptr(), rich_.turn_ptr(flat),
+                       (p_idx + cap) * 2ULL};
+        if (!invoke_drain_visitor(fn, std::move(*slot_cleanup.ptr))) {
+          keep_going = false;
+          break;
+        }
+      }
+      if (consumed > 0U) {
+        core_.sc_cursor = idx;
+        total += consumed;
+      }
+    }
+    if (keep_going && total < max_count &&
+        core_.overflow_ops.load(std::memory_order_relaxed) != 0U) {
+      const std::size_t fb_n = fallback_.drain(
+          [&](T&& item) noexcept(std::is_nothrow_invocable_v<Func&, T&&>) {
+            return invoke_drain_visitor(fn, std::move(item));
+          },
+          max_count - total);
+      if (fb_n > 0U) {
+        prod_park_.notify_if_waiters();
+      }
+      total += fb_n;
+    }
+    return total;
+  }
+
+  template <typename Func>
+  std::size_t drain_rich_mc(Func& fn, std::size_t max_count) noexcept(
+      std::is_nothrow_invocable_v<Func&, T&&>) {
+    std::size_t count = 0U;
+    const std::size_t cap = lane_cap_fast();
+    while (count < max_count) {
+      std::uint32_t lane = 0;
+      std::uint64_t ticket = 0;
+      std::optional<T> fb_out;
+      if (!ArchBackend::try_claim_rich_pop_mc_rseq(
+              core_, lane, ticket,
+              [this, &fb_out](std::uint32_t& l_out,
+                              std::uint64_t& t_out) noexcept {
+                return steal_or_retry_own_rich_opt_slow(l_out, t_out, fb_out);
+              })) {
+        break;
+      }
+      ++count;
+      if (lane == UINT32_MAX) [[unlikely]] {
+        if (!invoke_drain_visitor(fn, std::move(*fb_out))) {
+          break;
+        }
+        continue;
+      }
+      const std::size_t flat = rich_flat_index(lane, ticket);
+      const struct RichSlotCleanup {
+        RseqLaneEngine* self;
+        T* ptr;
+        std::uint64_t* turn_p;
+        std::uint64_t next_turn;
+        ~RichSlotCleanup() noexcept {
+          std::destroy_at(ptr);
+          __atomic_store_n(turn_p, next_turn, __ATOMIC_RELEASE);
+          self->prod_park_.notify_if_waiters();
+        }
+      } slot_cleanup{this, rich_.storage(flat).ptr(), rich_.turn_ptr(flat),
+                     (ticket + cap) * 2ULL};
+      if (!invoke_drain_visitor(fn, std::move(*slot_cleanup.ptr))) {
+        break;
+      }
+    }
+    return count;
   }
 
   THETA_ALIGNED_NOINLINE bool push_overflow_fallback_slow(
