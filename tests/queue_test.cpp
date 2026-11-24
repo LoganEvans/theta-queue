@@ -1015,7 +1015,12 @@ TEST(ConventionsAndPeerTest, MultiTuOdrAndTwoTierStateTransitions) {
   EXPECT_EQ(queue::detail::QueueTestPeer::spsc_cons_blocking_mode(spsc), 0U);
 
   std::thread delayed_prod([&]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (queue::detail::QueueTestPeer::spsc_cons_blocking_mode(spsc) < 2U &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
     spsc.push(42U);
   });
   EXPECT_EQ(spsc.pop(), 42U);
@@ -1243,6 +1248,124 @@ TEST(ConventionsAndPeerTest, FastMPMCOversubscribedBlockingConservation) {
   for (auto& w : workers) {
     w.join();
   }
+}
+
+TEST(ConventionsAndPeerTest, BurstWakeCoalescingAndMultiSleeperConservation) {
+  // 1. 8P + 1C burst wake coalescing across 80 epochs on FastMPSCQueue
+  //    (consumer parks between epochs, then 8 producers burst 128 items each).
+  {
+    constexpr int kProds = 8;
+    constexpr std::size_t kBurstPerProd = 128;
+    constexpr int kEpochs = 80;
+    FastMPSCQueue<TooLarge, 1024> q;
+    std::atomic<int> cur_epoch{0};
+    std::atomic<std::size_t> epoch_done{0};
+    std::atomic<uint64_t> checksum{0};
+
+    std::thread consumer([&]() {
+      constexpr std::size_t kTotalItems =
+          static_cast<std::size_t>(kProds) * kBurstPerProd * kEpochs;
+      uint64_t local_sum = 0U;
+      for (std::size_t i = 0; i < kTotalItems; ++i) {
+        const TooLarge item = q.pop();
+        local_sum += item.a ^ item.b;
+        epoch_done.fetch_add(1U, std::memory_order_release);
+      }
+      checksum.store(local_sum, std::memory_order_release);
+    });
+
+    std::vector<std::thread> prods;
+    prods.reserve(kProds);
+    for (int p = 0; p < kProds; ++p) {
+      prods.emplace_back([&, p]() {
+        for (int e = 1; e <= kEpochs; ++e) {
+          while (cur_epoch.load(std::memory_order_acquire) < e) {
+            std::this_thread::yield();
+          }
+          for (std::size_t i = 0; i < kBurstPerProd; ++i) {
+            const uint64_t v =
+                static_cast<uint64_t>(e * 10000 + p * 200) + i + 1U;
+            q.push(TooLarge{v, v * 3U});
+          }
+        }
+      });
+    }
+
+    uint64_t expected_sum = 0U;
+    for (int e = 1; e <= kEpochs; ++e) {
+      // Allow consumer to park between bursts on early epochs.
+      if (e <= 12) {
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+      }
+      cur_epoch.store(e, std::memory_order_release);
+      const std::size_t target =
+          static_cast<std::size_t>(e) * kProds * kBurstPerProd;
+      while (epoch_done.load(std::memory_order_acquire) < target) {
+        std::this_thread::yield();
+      }
+      for (int p = 0; p < kProds; ++p) {
+        for (std::size_t i = 0; i < kBurstPerProd; ++i) {
+          const uint64_t v =
+              static_cast<uint64_t>(e * 10000 + p * 200) + i + 1U;
+          expected_sum += (v ^ (v * 3U));
+        }
+      }
+    }
+
+    for (auto& t : prods) {
+      t.join();
+    }
+    consumer.join();
+    EXPECT_EQ(checksum.load(std::memory_order_acquire), expected_sum);
+  }
+
+  // 2. Multi-sleeper wakeup under tight capacity (`cap = 4`, 6P + 6C) on both
+  //    FastMPMCQueue (AsymmetricParkLot) and MPMCQueue (StripedParkLot).
+  auto verify_tight_mpmc = [](auto& q) {
+    constexpr int kThreads = 6;
+    constexpr std::size_t kItems = 512;
+    std::atomic<uint64_t> prod_sum{0};
+    std::atomic<uint64_t> cons_sum{0};
+    std::vector<std::thread> consumers;
+    std::vector<std::thread> producers;
+    consumers.reserve(kThreads);
+    producers.reserve(kThreads);
+
+    for (int c = 0; c < kThreads; ++c) {
+      consumers.emplace_back([&]() {
+        uint64_t acc = 0U;
+        for (std::size_t i = 0; i < kItems; ++i) {
+          acc += q.pop();
+        }
+        cons_sum.fetch_add(acc, std::memory_order_relaxed);
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    for (int p = 0; p < kThreads; ++p) {
+      producers.emplace_back([&, p]() {
+        uint64_t acc = 0U;
+        for (std::size_t i = 0; i < kItems; ++i) {
+          const uint64_t v = static_cast<uint64_t>(p * 1000) + i + 1U;
+          q.push(v);
+          acc += v;
+        }
+        prod_sum.fetch_add(acc, std::memory_order_relaxed);
+      });
+    }
+    for (auto& t : producers) {
+      t.join();
+    }
+    for (auto& t : consumers) {
+      t.join();
+    }
+    EXPECT_EQ(cons_sum.load(), prod_sum.load());
+    EXPECT_TRUE(q.empty());
+  };
+
+  FastMPMCQueue<uint64_t, 4> fast_q;
+  verify_tight_mpmc(fast_q);
+  MPMCQueue<uint64_t, 4> strict_q;
+  verify_tight_mpmc(strict_q);
 }
 
 }  // namespace

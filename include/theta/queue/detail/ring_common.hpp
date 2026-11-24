@@ -68,33 +68,38 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
       ArchBackend::stlf_micro_pause();
     }
     THETA_DISABLE_UNROLL
-    for (int spin = 0; spin < 16; ++spin) {
+    for (int spin = 0; spin < 64; ++spin) {
       if (pred()) {
         return;
       }
       ArchBackend::cpu_relax();
     }
   }
-  while (!pred()) {
-    std::uint8_t mode = 0U;
-    if (s == nullptr) [[unlikely]] {
+  if (pred()) {
+    return;
+  }
+  std::uint8_t mode = 0U;
+  if (s == nullptr) [[unlikely]] {
+    s = get_or_activate_state_slow(slot, mode);
+  } else {
+    mode = s->mode.load(std::memory_order_acquire);
+    if (mode < 2U) [[unlikely]] {
       s = get_or_activate_state_slow(slot, mode);
-    } else {
-      mode = s->mode.load(std::memory_order_acquire);
-      if (mode < 2U) [[unlikely]] {
-        s = get_or_activate_state_slow(slot, mode);
-      }
     }
-    const std::uint32_t ep = s->epoch.load(std::memory_order_relaxed);
-    s->waiters.fetch_add(1U, std::memory_order_seq_cst);
-#if THETA_ARCH_AARCH64
+  }
+  s->waiters.fetch_add(1U, std::memory_order_relaxed);
+  do {
+    const std::uint32_t ep = s->epoch.load(std::memory_order_acquire);
+    (void)s->needs_wake.exchange(1U, std::memory_order_seq_cst);
+#if !THETA_ARCH_X86_64 || THETA_TSAN_ENABLED
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
-    if (!pred()) {
-      park_epoch(s, ep, mode);
+    if (pred()) {
+      break;
     }
-    s->waiters.fetch_sub(1U, std::memory_order_seq_cst);
-  }
+    park_epoch(s, ep, mode);
+  } while (!pred());
+  s->waiters.fetch_sub(1U, std::memory_order_relaxed);
 }
 
 template <std::size_t kStripes>
@@ -113,34 +118,39 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
       ArchBackend::stlf_micro_pause();
     }
     THETA_DISABLE_UNROLL
-    for (int spin = 0; spin < 16; ++spin) {
+    for (int spin = 0; spin < 64; ++spin) {
       if (pred()) {
         return;
       }
       ArchBackend::cpu_relax();
     }
   }
-  while (!pred()) {
-    std::uint8_t mode = 0U;
-    if (s == nullptr) [[unlikely]] {
+  if (pred()) {
+    return;
+  }
+  std::uint8_t mode = 0U;
+  if (s == nullptr) [[unlikely]] {
+    s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+  } else {
+    mode = s->mode.load(std::memory_order_acquire);
+    if (mode < 2U) [[unlikely]] {
       s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
-    } else {
-      mode = s->mode.load(std::memory_order_acquire);
-      if (mode < 2U) [[unlikely]] {
-        s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
-      }
     }
-    ParkStripe& st = s->stripes[stripe_idx];
-    const std::uint32_t ep = st.epoch.load(std::memory_order_relaxed);
-    st.waiters.fetch_add(1U, std::memory_order_seq_cst);
-#if THETA_ARCH_AARCH64
+  }
+  ParkStripe& st = s->stripes[stripe_idx];
+  st.waiters.fetch_add(1U, std::memory_order_relaxed);
+  do {
+    const std::uint32_t ep = st.epoch.load(std::memory_order_acquire);
+    (void)st.needs_wake.exchange(1U, std::memory_order_seq_cst);
+#if !THETA_ARCH_X86_64 || THETA_TSAN_ENABLED
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
-    if (!pred()) {
-      StripedParkLotBase::park_stripe_epoch(st, ep, mode);
+    if (pred()) {
+      break;
     }
-    st.waiters.fetch_sub(1U, std::memory_order_seq_cst);
-  }
+    StripedParkLotBase::park_stripe_epoch(st, ep, mode);
+  } while (!pred());
+  st.waiters.fetch_sub(1U, std::memory_order_relaxed);
 }
 
 // Hybrid turn-sequenced slot storage:

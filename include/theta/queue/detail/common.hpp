@@ -112,8 +112,9 @@ class THETA_QUEUE_SCOPED_LOCKABLE ColdSpinGuard {
   ColdSpinLock& lk_;
 };
 
-struct ParkStripe {
+struct alignas(kHardwareConstructiveInterferenceSize) ParkStripe {
   std::atomic<std::uint32_t> waiters{0};
+  std::atomic<std::uint32_t> needs_wake{0};
   std::atomic<std::uint32_t> epoch{0};
 };
 
@@ -127,6 +128,7 @@ inline constexpr std::memory_order kParkFastLoadOrder =
 
 struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
   std::atomic<std::uint32_t> waiters{0};
+  std::atomic<std::uint32_t> needs_wake{0};
   std::atomic<std::uint32_t> epoch{0};
   std::atomic<std::uint8_t> mode{1};
   ColdSpinLock activate_lock;
@@ -138,9 +140,10 @@ struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
 //   `0` heap allocs, and never escapes `&this` so unescaped local queues stay
 //   100% SROA-promotable into registers).
 // - Tier 2 (`state_ != nullptr`, allocated & promoted once via a single
-//   `SYS_membarrier` on the very first park): pairs `seq_cst` StoreLoad fence
-//   on notifiers with `waiters.fetch_add` on sleepers in `src/queue.cpp` so
-//   subsequent parks need ZERO ongoing `SYS_membarrier` IPIs.
+//   `SYS_membarrier` on the very first park): inline `seq_cst` StoreLoad fence
+//   + clean `Shared`-state `needs_wake` read (`0` `CALL`s and `0` `SYS_futex`
+//   syscalls when no sleeper is armed, and single-shot `exchange(0)` wake
+//   coalescing in `src/queue.cpp` when armed).
 class AsymmetricParkLot {
   friend struct QueueTestPeer;
 
@@ -174,7 +177,10 @@ class AsymmetricParkLot {
       std::atomic<AsymmetricParkState*>& slot) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = slot.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      notify_active_slow(s);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (s->needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+        wake_active_slow(s);
+      }
     }
   }
 
@@ -189,7 +195,7 @@ class AsymmetricParkLot {
       std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept;
 
  private:
-  [[gnu::cold]] static void notify_active_slow(AsymmetricParkState* s) noexcept;
+  [[gnu::cold]] static void wake_active_slow(AsymmetricParkState* s) noexcept;
   [[gnu::cold]] static AsymmetricParkState* get_or_activate_state_slow(
       std::atomic<AsymmetricParkState*>& slot, std::uint8_t& out_mode) noexcept;
   [[gnu::cold]] static void park_epoch(AsymmetricParkState* s, std::uint32_t ep,
@@ -214,8 +220,7 @@ struct alignas(kHardwareDestructiveInterferenceSize) StripedParkState {
 struct StripedParkLotBase {
   [[gnu::cold]] static StripedParkState* get_or_activate_state_slow(
       std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept;
-  [[gnu::cold]] static void notify_ticket_active_slow(
-      StripedParkState* state, std::size_t stripe_idx) noexcept;
+  [[gnu::cold]] static void wake_stripe_slow(ParkStripe& stripe) noexcept;
   [[gnu::cold]] static void notify_range_active_slow(
       StripedParkState* state, std::size_t ring_mask, std::size_t stripe_mask,
       std::uint64_t base_ticket, std::size_t count) noexcept;
@@ -226,7 +231,8 @@ struct StripedParkLotBase {
 };
 
 // Compact 8-byte lazy ticket-striped 2-Tier eventcount: eliminates thundering
-// herds, ongoing `SYS_membarrier` IPIs, and non-blocking stripe footprint.
+// herds, cross-stripe false sharing, ongoing `SYS_membarrier` IPIs, and
+// redundant `FUTEX_WAKE` storms.
 template <std::size_t kStripes = 16>
 class StripedParkLot {
   static_assert((kStripes & (kStripes - 1U)) == 0U && kStripes >= 2U &&
@@ -252,8 +258,12 @@ class StripedParkLot {
   THETA_FORCE_INLINE void notify_ticket(std::uint64_t ticket) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      StripedParkLotBase::notify_ticket_active_slow(
-          s, static_cast<std::size_t>(ticket) & kStripeMask);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      ParkStripe& stripe =
+          s->stripes[static_cast<std::size_t>(ticket) & kStripeMask];
+      if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+        StripedParkLotBase::wake_stripe_slow(stripe);
+      }
     }
   }
 

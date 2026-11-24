@@ -119,11 +119,10 @@ asymmetric_membarrier_rseq_expedited() noexcept {
   return false;
 }
 
-[[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::notify_active_slow(
+[[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::wake_active_slow(
     AsymmetricParkState* s) noexcept {
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (s->waiters.load(std::memory_order_seq_cst) != 0U) [[unlikely]] {
-    s->epoch.fetch_add(1U, std::memory_order_seq_cst);
+  if (s->needs_wake.exchange(0U, std::memory_order_acq_rel) != 0U) {
+    s->epoch.fetch_add(1U, std::memory_order_acq_rel);
     futex_wake_all_u32(&s->epoch);
   }
 }
@@ -213,13 +212,10 @@ StripedParkLotBase::get_or_activate_state_slow(
   return s;
 }
 
-[[gnu::noinline, gnu::aligned(64)]] void
-StripedParkLotBase::notify_ticket_active_slow(StripedParkState* state,
-                                              std::size_t stripe_idx) noexcept {
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  ParkStripe& stripe = state->stripes[stripe_idx];
-  if (stripe.waiters.load(std::memory_order_seq_cst) != 0U) [[unlikely]] {
-    stripe.epoch.fetch_add(1U, std::memory_order_seq_cst);
+[[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::wake_stripe_slow(
+    ParkStripe& stripe) noexcept {
+  if (stripe.needs_wake.exchange(0U, std::memory_order_acq_rel) != 0U) {
+    stripe.epoch.fetch_add(1U, std::memory_order_acq_rel);
     futex_wake_all_u32(&stripe.epoch);
   }
 }
@@ -238,10 +234,12 @@ StripedParkLotBase::notify_range_active_slow(StripedParkState* state,
   for (std::size_t i = 0; i < n; ++i) {
     const std::size_t idx =
         (static_cast<std::size_t>(base_ticket + i) & ring_mask) & stripe_mask;
-    if (stripes[idx].waiters.load(std::memory_order_relaxed) != 0U)
-        [[unlikely]] {
-      stripes[idx].epoch.fetch_add(1U, std::memory_order_seq_cst);
-      futex_wake_all_u32(&stripes[idx].epoch);
+    if (stripes[idx].needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+      if (stripes[idx].needs_wake.exchange(0U, std::memory_order_acq_rel) !=
+          0U) {
+        stripes[idx].epoch.fetch_add(1U, std::memory_order_acq_rel);
+        futex_wake_all_u32(&stripes[idx].epoch);
+      }
     }
   }
 }
