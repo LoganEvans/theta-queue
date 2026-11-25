@@ -59,7 +59,7 @@ template <typename StopPred>
 THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
     std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept {
   AsymmetricParkState* s = slot.load(std::memory_order_acquire);
-  if (s == nullptr || s->waiters.load(std::memory_order_relaxed) == 0U) {
+  if (s == nullptr) {
     THETA_DISABLE_UNROLL
     for (int spin = 0; spin < 20; ++spin) {
       if (pred()) {
@@ -67,9 +67,29 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
       }
       ArchBackend::stlf_micro_pause();
     }
+    constexpr int kInitRelax = park_relax_budget(kMaxParkSpinShift);
     THETA_DISABLE_UNROLL
-    for (int spin = 0; spin < 64; ++spin) {
+    for (int spin = 0; spin < kInitRelax; ++spin) {
       if (pred()) {
+        return;
+      }
+      ArchBackend::cpu_relax();
+    }
+  } else if (s->waiters.load(std::memory_order_relaxed) == 0U) {
+    THETA_DISABLE_UNROLL
+    for (int spin = 0; spin < 20; ++spin) {
+      if (pred()) {
+        s->spin_shift.store(kMaxParkSpinShift, std::memory_order_relaxed);
+        return;
+      }
+      ArchBackend::stlf_micro_pause();
+    }
+    const int relax_budget = park_relax_budget(static_cast<std::uint8_t>(
+        s->spin_shift.load(std::memory_order_relaxed)));
+    THETA_DISABLE_UNROLL
+    for (int spin = 0; spin < relax_budget; ++spin) {
+      if (pred()) {
+        s->spin_shift.store(kMaxParkSpinShift, std::memory_order_relaxed);
         return;
       }
       ArchBackend::cpu_relax();
@@ -82,7 +102,7 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
   if (s == nullptr) [[unlikely]] {
     s = get_or_activate_state_slow(slot, mode);
   } else {
-    mode = s->mode.load(std::memory_order_acquire);
+    mode = static_cast<std::uint8_t>(s->mode.load(std::memory_order_acquire));
     if (mode < 2U) [[unlikely]] {
       s = get_or_activate_state_slow(slot, mode);
     }
@@ -105,7 +125,8 @@ THETA_ALIGNED_NOINLINE void AsymmetricParkLot::wait_slot_until(
 template <std::size_t kStripes>
 template <typename StopPred>
 THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
-    std::uint64_t ticket, StopPred&& pred) noexcept {
+    std::uint64_t ticket, StopPred&& pred,
+    bool enable_work_conserving) noexcept {
   const std::size_t stripe_idx = static_cast<std::size_t>(ticket) & kStripeMask;
   StripedParkState* s = state_.load(std::memory_order_acquire);
   if (s == nullptr ||
@@ -118,7 +139,7 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
       ArchBackend::stlf_micro_pause();
     }
     THETA_DISABLE_UNROLL
-    for (int spin = 0; spin < 64; ++spin) {
+    for (int spin = 0; spin < kStripeTicketRelaxIters; ++spin) {
       if (pred()) {
         return;
       }
@@ -132,9 +153,21 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
   if (s == nullptr) [[unlikely]] {
     s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
   } else {
-    mode = s->mode.load(std::memory_order_acquire);
+    mode = static_cast<std::uint8_t>(s->mode.load(std::memory_order_acquire));
     if (mode < 2U) [[unlikely]] {
       s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+    }
+  }
+  // Activate multi-consumer work-conserving mode only when >= 2 consumers
+  // concurrently wait on an empty queue (`ticket_waiters >= 1`), without
+  // touching `StripedParkState`'s header cache line on producer parks or
+  // non-empty floods (`BM_MPMC_Blocking`, `BM_CrossCorePingPong`).
+  bool tracked_tw = false;
+  if (enable_work_conserving &&
+      s->work_conserving.load(std::memory_order_relaxed) == 0U) [[unlikely]] {
+    tracked_tw = true;
+    if (s->ticket_waiters.fetch_add(1U, std::memory_order_acq_rel) >= 1U) {
+      s->work_conserving.store(1U, std::memory_order_release);
     }
   }
   ParkStripe& st = s->stripes[stripe_idx];
@@ -151,6 +184,115 @@ THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_ticket(
     StripedParkLotBase::park_stripe_epoch(st, ep, mode);
   } while (!pred());
   st.waiters.fetch_sub(1U, std::memory_order_relaxed);
+  if (tracked_tw) [[unlikely]] {
+    s->ticket_waiters.fetch_sub(1U, std::memory_order_release);
+  }
+}
+
+template <std::size_t kStripes>
+template <typename TryClaimFn, typename HasReadyFn>
+THETA_ALIGNED_NOINLINE void StripedParkLot<kStripes>::wait_unclaimed(
+    TryClaimFn&& try_claim, HasReadyFn&& has_ready) noexcept {
+  std::uint8_t mode = 0U;
+  StripedParkState* s = state_.load(std::memory_order_acquire);
+  if (s == nullptr) [[unlikely]] {
+    s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+  } else {
+    mode = static_cast<std::uint8_t>(s->mode.load(std::memory_order_acquire));
+    if (mode < 2U) [[unlikely]] {
+      s = StripedParkLotBase::get_or_activate_state_slow(state_, mode);
+    }
+  }
+  if (s->work_conserving.load(std::memory_order_relaxed) == 0U) [[unlikely]] {
+    s->work_conserving.store(1U, std::memory_order_release);
+  }
+
+  for (;;) {
+    if (try_claim()) {
+      return;
+    }
+
+    // 1. Single Designated Lead Spinner: spins read-only on `has_ready()` and
+    //    clears `unclaimed_spinner` (`seq_cst`) BEFORE advancing `head_` in
+    //    `try_claim()`, closing any gap between `unclaimed_spinner == 1` and
+    //    `pos != head_` on concurrent producer pushes.
+    if (s->unclaimed_spinner.load(std::memory_order_relaxed) == 0U &&
+        s->unclaimed_spinner.exchange(1U, std::memory_order_acquire) == 0U) {
+      bool ready = false;
+      THETA_DISABLE_UNROLL
+      for (int spin = 0; spin < 20; ++spin) {
+        if (has_ready()) {
+          ready = true;
+          break;
+        }
+        ArchBackend::stlf_micro_pause();
+      }
+      if (!ready) {
+        const int relax_budget = park_relax_budget(static_cast<std::uint8_t>(
+            s->spin_shift.load(std::memory_order_relaxed)));
+        THETA_DISABLE_UNROLL
+        for (int spin = 0; spin < relax_budget; ++spin) {
+          if (has_ready()) {
+            ready = true;
+            break;
+          }
+          ArchBackend::cpu_relax();
+        }
+      }
+      (void)s->unclaimed_spinner.exchange(0U, std::memory_order_seq_cst);
+#if !THETA_ARCH_X86_64 || THETA_TSAN_ENABLED
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+      if (ready) {
+        s->spin_shift.store(kMaxParkSpinShift, std::memory_order_relaxed);
+      }
+      if (try_claim()) {
+        if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U && has_ready())
+            [[unlikely]] {
+          StripedParkLotBase::wake_unclaimed_one_slow(s);
+        }
+        return;
+      }
+      if (ready) {
+        // Another consumer stole the item right after `has_ready()`; loop to
+        // re-elect spinner without parking prematurely.
+        continue;
+      }
+    }
+
+    // 2. Unclaimed Sleeper: zero pre-claimed tickets (`0` head-of-line `p99`
+    //    blocking) + exact `unclaimed_waiters` count + single-sleeper
+    //    `FUTEX_WAKE(1)` (`0` thundering herd, `0` lost wakeups).
+    s->unclaimed_waiters.fetch_add(1U, std::memory_order_seq_cst);
+#if !THETA_ARCH_X86_64 || THETA_TSAN_ENABLED
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+    bool claimed = false;
+    do {
+      const std::uint32_t ep =
+          s->unclaimed_epoch.load(std::memory_order_acquire);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (try_claim()) {
+        claimed = true;
+        break;
+      }
+      StripedParkLotBase::park_unclaimed_epoch(s, ep, mode);
+      if (try_claim()) {
+        claimed = true;
+        break;
+      }
+    } while (s->unclaimed_spinner.load(std::memory_order_relaxed) != 0U &&
+             s->work_conserving.load(std::memory_order_relaxed) != 0U);
+
+    const std::uint32_t rem =
+        s->unclaimed_waiters.fetch_sub(1U, std::memory_order_acq_rel) - 1U;
+    if (claimed) {
+      if (rem != 0U && has_ready()) [[unlikely]] {
+        StripedParkLotBase::wake_unclaimed_one_slow(s);
+      }
+      return;
+    }
+  }
 }
 
 // Hybrid turn-sequenced slot storage:

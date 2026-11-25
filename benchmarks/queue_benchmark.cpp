@@ -12,6 +12,7 @@
 #include <barrier>
 #include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1791,6 +1792,203 @@ BENCHMARK_TEMPLATE(BM_TailLatency_MPSC_NoisyNeighbor, FollyMPMCAdaptor)
 #if defined(THETA_QUEUE_HAS_ATOMIC_QUEUE)
 BENCHMARK_TEMPLATE(BM_TailLatency_MPSC_NoisyNeighbor, AtomicQueueAdaptor)
     ->UseRealTime();
+#endif
+
+// ---------------------------------------------------------------------------
+// Group 9: Open-Loop / Under-Saturated 6-Thread RPC Service Pipeline
+//   Mirrors `theta-app-bench` `service_sla_bench`:
+//   2 ingress producers -> StorageQueue (3 consumers, ~1.8 us simulated DB Get)
+//                       +  AuditQueue   (1 consumer,  ~0.6 us simulated LZ4)
+//   `state.range(0)` = target kRPS (e.g. 260, 365, or 0 for max saturation).
+// ---------------------------------------------------------------------------
+template <BlockingQueueAdaptor StorageQ, BlockingQueueAdaptor AuditQ>
+void BM_TailLatency_OpenLoopRPC_6T(  // NOLINT(readability-identifier-naming)
+    benchmark::State& state) {
+  constexpr int kIngress = 2;
+  constexpr int kStorage = 3;
+  constexpr int kReqsPerIngress = 512;
+  constexpr int kTotalReqs = kIngress * kReqsPerIngress;
+  constexpr int kTotalCompletions = kTotalReqs * 2;
+
+  const auto target_krps = static_cast<uint64_t>(state.range(0));
+  const uint64_t interval_ns =
+      target_krps > 0U
+          ? ((1'000'000ULL * static_cast<uint64_t>(kIngress)) / target_krps)
+          : 0ULL;
+
+  StorageQ storage_q{};
+  AuditQ audit_q{};
+
+  std::vector<int> req_tokens(static_cast<std::size_t>(kTotalReqs), 0);
+  std::vector<uint64_t> sched_ns_vec(static_cast<std::size_t>(kTotalReqs), 0U);
+  std::vector<uint32_t> iter_lat_ns(static_cast<std::size_t>(kTotalReqs), 0U);
+  std::vector<uint32_t> all_e2e_ns;
+  all_e2e_ns.reserve(65536);
+  int stop_token = -1;
+
+  std::mutex epoch_mu;
+  std::condition_variable start_cv;
+  std::condition_variable done_cv;
+  uint64_t epoch = 0;
+  uint64_t burst_t0 = 0;
+  std::atomic<int> completions{0};
+  std::atomic<uint64_t> sink{0};
+  bool shutdown = false;
+
+  auto busy_work_ns = [](uint64_t ns, uint64_t seed) noexcept -> uint64_t {
+    const uint64_t deadline = steady_now_ns() + ns;
+    uint64_t x = seed ^ 0x9E3779B97F4A7C15ULL;
+    do {
+      for (int k = 0; k < 16; ++k) {
+        x ^= x >> 12U;
+        x ^= x << 25U;
+        x ^= x >> 27U;
+        x *= 0x2545F4914F6CDD1DULL;
+      }
+    } while (steady_now_ns() < deadline);
+    return x;
+  };
+
+  std::vector<std::thread> ingress;
+  ingress.reserve(kIngress);
+  for (int ing = 0; ing < kIngress; ++ing) {
+    ingress.emplace_back([&, ing]() {
+      uint64_t seen = 0;
+      for (;;) {
+        uint64_t t0 = 0;
+        {
+          std::unique_lock<std::mutex> lk(epoch_mu);
+          start_cv.wait(lk, [&] { return shutdown || epoch > seen; });
+          if (shutdown) {
+            return;
+          }
+          seen = epoch;
+          t0 = burst_t0;
+        }
+        for (int i = 0; i < kReqsPerIngress; ++i) {
+          const auto slot = static_cast<std::size_t>(ing * kReqsPerIngress + i);
+          const uint64_t sched =
+              interval_ns > 0U
+                  ? (t0 + static_cast<uint64_t>(i) * interval_ns +
+                     static_cast<uint64_t>(ing) * (interval_ns / 2U))
+                  : steady_now_ns();
+          if (interval_ns > 0U) {
+            while (steady_now_ns() < sched) {
+              cpu_relax();
+            }
+          } else {
+            sink.fetch_add(busy_work_ns(1'600U, slot),
+                           std::memory_order_relaxed);
+          }
+          sched_ns_vec[slot] = sched;
+          req_tokens[slot] = static_cast<int>(slot);
+          storage_q.push(&req_tokens[slot]);
+          audit_q.push(&req_tokens[slot]);
+        }
+      }
+    });
+  }
+
+  std::vector<std::thread> storage;
+  storage.reserve(kStorage);
+  for (int w = 0; w < kStorage; ++w) {
+    storage.emplace_back([&]() {
+      for (;;) {
+        const int* tok = storage_q.pop();
+        if (tok == &stop_token) {
+          return;
+        }
+        const auto slot = static_cast<std::size_t>(*tok);
+        sink.fetch_add(busy_work_ns(1'800U, slot), std::memory_order_relaxed);
+        const uint64_t done = steady_now_ns();
+        const uint64_t tx = sched_ns_vec[slot];
+        iter_lat_ns[slot] = static_cast<uint32_t>(done > tx ? (done - tx) : 1U);
+        if (completions.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+            kTotalCompletions) {
+          const std::lock_guard<std::mutex> lk(epoch_mu);
+          done_cv.notify_one();
+        }
+      }
+    });
+  }
+
+  std::thread audit([&]() {
+    for (;;) {
+      const int* tok = audit_q.pop();
+      if (tok == &stop_token) {
+        return;
+      }
+      sink.fetch_add(busy_work_ns(600U, static_cast<uint64_t>(*tok)),
+                     std::memory_order_relaxed);
+      if (completions.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+          kTotalCompletions) {
+        const std::lock_guard<std::mutex> lk(epoch_mu);
+        done_cv.notify_one();
+      }
+    }
+  });
+
+  for (auto state_tok : state) {
+    benchmark::DoNotOptimize(state_tok);
+    completions.store(0, std::memory_order_relaxed);
+    {
+      const std::lock_guard<std::mutex> lk(epoch_mu);
+      burst_t0 = steady_now_ns();
+      ++epoch;
+    }
+    start_cv.notify_all();
+    {
+      std::unique_lock<std::mutex> lk(epoch_mu);
+      done_cv.wait(lk, [&] {
+        return completions.load(std::memory_order_acquire) == kTotalCompletions;
+      });
+    }
+    if (all_e2e_ns.size() + kTotalReqs <= 131072U) {
+      all_e2e_ns.insert(all_e2e_ns.end(), iter_lat_ns.begin(),
+                        iter_lat_ns.end());
+    }
+  }
+
+  {
+    const std::lock_guard<std::mutex> lk(epoch_mu);
+    shutdown = true;
+  }
+  start_cv.notify_all();
+  for (auto& t : ingress) {
+    t.join();
+  }
+  for (int w = 0; w < kStorage; ++w) {
+    storage_q.push(&stop_token);
+  }
+  audit_q.push(&stop_token);
+  for (auto& t : storage) {
+    t.join();
+  }
+  audit.join();
+
+  benchmark::DoNotOptimize(sink.load(std::memory_order_relaxed));
+  record_percentiles(state, "e2e_", all_e2e_ns);
+  state.SetItemsProcessed(state.iterations() *
+                          static_cast<int64_t>(kTotalReqs));
+}
+
+#define THETA_OPENLOOP_RPC_ARGS ->Arg(260)->Arg(365)->Arg(0)->UseRealTime()
+
+BENCHMARK_TEMPLATE(BM_TailLatency_OpenLoopRPC_6T, ThetaMPMCStaticAdaptor,
+                   ThetaMPSCAdaptor)
+THETA_OPENLOOP_RPC_ARGS;
+BENCHMARK_TEMPLATE(BM_TailLatency_OpenLoopRPC_6T, ThetaFastMPMCAdaptor,
+                   ThetaFastMPSCAdaptor)
+THETA_OPENLOOP_RPC_ARGS;
+#if defined(THETA_QUEUE_HAS_FOLLY)
+BENCHMARK_TEMPLATE(BM_TailLatency_OpenLoopRPC_6T, FollyMPMCAdaptor,
+                   FollyMPMCAdaptor)
+THETA_OPENLOOP_RPC_ARGS;
+#endif
+#if defined(THETA_QUEUE_HAS_ABSL)
+BENCHMARK_TEMPLATE(BM_TailLatency_OpenLoopRPC_6T, AbslMutexRingAdaptor,
+                   AbslMutexRingAdaptor)
+THETA_OPENLOOP_RPC_ARGS;
 #endif
 
 }  // namespace

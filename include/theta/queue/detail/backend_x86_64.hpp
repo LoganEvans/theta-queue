@@ -362,7 +362,7 @@ struct ArchBackend {
     if (core.try_assign_cons_slot_slow()) {
       goto retry_pop;
     }
-    return steal_fn(out) > 0;
+    goto steal_pop;
   }
 
   static THETA_FORCE_INLINE RseqPushResult
@@ -632,7 +632,7 @@ struct ArchBackend {
     if (core.try_assign_cons_slot_slow()) {
       goto retry_rich_pop;
     }
-    return steal_fn(out_lane, out_ticket) > 0;
+    goto steal_rich_pop;
   }
 #else
   static RseqPushResult try_push_word_rseq(RseqLaneCore& /*core*/,

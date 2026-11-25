@@ -96,11 +96,11 @@ class MPMCQueue {
     const std::uint64_t expected = (pos >> sh) << 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
         [[unlikely]] {
-      wait_turn(prod_park_, ring_slot, phys, expected);
+      wait_prod_turn(ring_slot, phys, expected);
     }
     slots_.storage(phys).construct(std::forward<Args>(args)...);
     slots_.turn(phys).store(expected + 1U, std::memory_order_release);
-    cons_park_.notify_ticket(ring_slot);
+    cons_park_.notify_consumer_ticket(ring_slot, pos, head_);
   }
 
   void push(const T& val) noexcept(std::is_nothrow_copy_constructible_v<T>)
@@ -132,7 +132,7 @@ class MPMCQueue {
                                         std::memory_order_acquire)) [[likely]] {
           slots_.storage(phys).construct(std::forward<Args>(args)...);
           slots_.turn(phys).store(expected + 1U, std::memory_order_release);
-          cons_park_.notify_ticket(ring_slot);
+          cons_park_.notify_consumer_ticket(ring_slot, pos, head_);
           return true;
         }
         queue::detail::ArchBackend::stlf_micro_pause();
@@ -223,6 +223,9 @@ class MPMCQueue {
   }
 
   T pop() noexcept {
+    if (cons_park_.is_work_conserving()) [[unlikely]] {
+      return pop_work_conserving();
+    }
     const std::size_t m = buf_mask();
     const std::size_t sh = buf_shift();
     const std::uint64_t pos = head_.fetch_add(1U, std::memory_order_relaxed);
@@ -231,7 +234,7 @@ class MPMCQueue {
     const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
         [[unlikely]] {
-      wait_turn(cons_park_, ring_slot, phys, expected);
+      wait_cons_turn(pos, ring_slot, phys, expected);
     }
     T out{slots_.storage(phys).move_and_destroy()};
     slots_.turn(phys).store(expected + 1U, std::memory_order_release);
@@ -240,6 +243,10 @@ class MPMCQueue {
   }
 
   void pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
+    if (cons_park_.is_work_conserving()) [[unlikely]] {
+      pop_work_conserving_into(out);
+      return;
+    }
     out = pop();
   }
 
@@ -437,12 +444,186 @@ class MPMCQueue {
     }
   }
 
-  THETA_ALIGNED_NOINLINE void wait_turn(queue::detail::StripedParkLot<16>& lot,
-                                        std::size_t ring_slot, std::size_t phys,
-                                        std::uint64_t expected) noexcept {
-    lot.wait_ticket(ring_slot, [this, phys, expected]() noexcept {
-      return slots_.turn(phys).load(std::memory_order_acquire) == expected;
-    });
+  THETA_ALIGNED_NOINLINE void wait_prod_turn(std::size_t ring_slot,
+                                             std::size_t phys,
+                                             std::uint64_t expected) noexcept {
+    prod_park_.wait_ticket(
+        ring_slot,
+        [this, phys, expected]() noexcept {
+          return slots_.turn(phys).load(std::memory_order_acquire) == expected;
+        },
+        /*enable_work_conserving=*/false);
+  }
+
+  THETA_ALIGNED_NOINLINE void wait_cons_turn(std::uint64_t pos,
+                                             std::size_t ring_slot,
+                                             std::size_t phys,
+                                             std::uint64_t expected) noexcept {
+    // Enable work-conserving mode only when the queue is genuinely empty
+    // (`pos >= tail_`), NOT when a single oversubscribed producer was preempted
+    // mid-push during a deep flood (`tail_ > pos + 1`, e.g.
+    // `BM_MPMC_Blocking`).
+    const bool queue_empty = (pos >= tail_.load(std::memory_order_relaxed));
+    cons_park_.wait_ticket(
+        ring_slot,
+        [this, phys, expected]() noexcept {
+          return slots_.turn(phys).load(std::memory_order_acquire) == expected;
+        },
+        /*enable_work_conserving=*/queue_empty);
+  }
+
+  THETA_FORCE_INLINE void maybe_promote_to_flood_mode(std::uint64_t pos,
+                                                      std::size_t m,
+                                                      std::size_t sh) noexcept {
+    // Switch back to wait-free `head_.fetch_add(1)` (`LOCK XADD`)
+    // unconditionally (waking any remaining unclaimed sleepers) once >= 9 items
+    // accumulate in the ring—preserving 100% `LOCK XADD` throughput under
+    // oversubscribed 4P+4C / 8P+8C floods while keeping shallow 0..3 item RPC
+    // queues 100% work-conserving without mode oscillation.
+    if (((pos & 7U) == 0U) && (m >= 15U)) [[unlikely]] {
+      const std::uint64_t p_ahead = pos + 8U;
+      const std::size_t phys_ahead = queue::detail::remap_slot_index(
+          static_cast<std::size_t>(p_ahead) & m, sh);
+      if (slots_.turn(phys_ahead).load(std::memory_order_relaxed) ==
+          ((p_ahead >> sh) << 1U) + 1U) [[unlikely]] {
+        cons_park_.promote_to_flood_mode();
+      }
+    }
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE bool has_ready_item() const noexcept {
+    const std::size_t m = buf_mask();
+    const std::size_t sh = buf_shift();
+    for (;;) {
+      const std::uint64_t pos = head_.load(std::memory_order_acquire);
+      const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
+      const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
+      const std::uint64_t seq =
+          slots_.turn(phys).load(std::memory_order_acquire);
+      const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
+      const auto diff =
+          static_cast<std::int64_t>(seq) - static_cast<std::int64_t>(expected);
+      if (diff == 0) {
+        return true;
+      }
+      if (diff < 0) {
+        if (head_.load(std::memory_order_acquire) == pos) {
+          return false;
+        }
+      }
+    }
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE bool try_claim_work_conserving(
+      std::optional<T>& out) noexcept {
+    const std::size_t m = buf_mask();
+    const std::size_t sh = buf_shift();
+    std::uint64_t pos = head_.load(std::memory_order_relaxed);
+    for (;;) {
+      const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
+      const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
+      const std::uint64_t seq =
+          slots_.turn(phys).load(std::memory_order_acquire);
+      const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
+      const auto diff =
+          static_cast<std::int64_t>(seq) - static_cast<std::int64_t>(expected);
+      if (diff == 0) [[likely]] {
+        if (head_.compare_exchange_weak(pos, pos + 1U,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_acquire)) [[likely]] {
+          out.emplace(slots_.storage(phys).move_and_destroy());
+          slots_.turn(phys).store(expected + 1U, std::memory_order_release);
+          prod_park_.notify_ticket(ring_slot);
+          maybe_promote_to_flood_mode(pos, m, sh);
+          if (cons_park_.has_unclaimed_waiters() && has_ready_item())
+              [[unlikely]] {
+            cons_park_.wake_one_unclaimed();
+          }
+          return true;
+        }
+        queue::detail::ArchBackend::stlf_micro_pause();
+      } else if (diff < 0) {
+        const std::uint64_t fresh = head_.load(std::memory_order_acquire);
+        if (fresh == pos) {
+          return false;
+        }
+        pos = fresh;
+      } else {
+        queue::detail::ArchBackend::stlf_micro_pause();
+        pos = head_.load(std::memory_order_relaxed);
+      }
+    }
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE bool try_claim_work_conserving_into(
+      T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
+    const std::size_t m = buf_mask();
+    const std::size_t sh = buf_shift();
+    std::uint64_t pos = head_.load(std::memory_order_relaxed);
+    for (;;) {
+      const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
+      const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
+      const std::uint64_t seq =
+          slots_.turn(phys).load(std::memory_order_acquire);
+      const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
+      const auto diff =
+          static_cast<std::int64_t>(seq) - static_cast<std::int64_t>(expected);
+      if (diff == 0) [[likely]] {
+        if (head_.compare_exchange_weak(pos, pos + 1U,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_acquire)) [[likely]] {
+          slots_.storage(phys).move_into_and_destroy(out);
+          slots_.turn(phys).store(expected + 1U, std::memory_order_release);
+          prod_park_.notify_ticket(ring_slot);
+          maybe_promote_to_flood_mode(pos, m, sh);
+          if (cons_park_.has_unclaimed_waiters() && has_ready_item())
+              [[unlikely]] {
+            cons_park_.wake_one_unclaimed();
+          }
+          return true;
+        }
+        queue::detail::ArchBackend::stlf_micro_pause();
+      } else if (diff < 0) {
+        const std::uint64_t fresh = head_.load(std::memory_order_acquire);
+        if (fresh == pos) {
+          return false;
+        }
+        pos = fresh;
+      } else {
+        queue::detail::ArchBackend::stlf_micro_pause();
+        pos = head_.load(std::memory_order_relaxed);
+      }
+    }
+  }
+
+  [[nodiscard]] THETA_ALIGNED_NOINLINE T pop_work_conserving() noexcept {
+    std::optional<T> out;
+    if (try_claim_work_conserving(out)) [[likely]] {
+      return std::move(*out);
+    }
+    cons_park_.wait_unclaimed(
+        [this, &out]() noexcept { return try_claim_work_conserving(out); },
+        [this]() noexcept { return has_ready_item(); });
+    if (!out.has_value()) {
+      std::unreachable();
+    }
+    return std::move(*out);
+  }
+
+  THETA_ALIGNED_NOINLINE void pop_work_conserving_into(T& out) noexcept(
+      std::is_nothrow_move_assignable_v<T>) {
+    if (try_claim_work_conserving_into(out)) [[likely]] {
+      return;
+    }
+    bool got = false;
+    cons_park_.wait_unclaimed(
+        [this, &out, &got]() noexcept(std::is_nothrow_move_assignable_v<T>) {
+          if (!got) {
+            got = try_claim_work_conserving_into(out);
+          }
+          return got;
+        },
+        [this]() noexcept { return has_ready_item(); });
   }
 
   const std::size_t cap_;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,33 @@ constinit std::atomic<std::uint8_t> g_membarrier_exp_state{0};
 constinit std::atomic<std::uint8_t> g_membarrier_rseq_state{0};
 #endif
 
+THETA_FORCE_INLINE void futex_wake_one_u32(
+    std::atomic<std::uint32_t>* addr) noexcept {
+#if THETA_OS_LINUX && !THETA_TSAN_ENABLED
+  (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(addr),
+                  FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+#else
+  addr->notify_one();
+#endif
+}
+
+THETA_FORCE_INLINE void futex_wake_n_u32(std::atomic<std::uint32_t>* addr,
+                                         std::size_t count) noexcept {
+#if THETA_OS_LINUX && !THETA_TSAN_ENABLED
+  const int n = count >= static_cast<std::size_t>(INT_MAX)
+                    ? INT_MAX
+                    : static_cast<int>(count);
+  (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(addr),
+                  FUTEX_WAKE_PRIVATE, n, nullptr, nullptr, 0);
+#else
+  if (count <= 1U) {
+    addr->notify_one();
+  } else {
+    addr->notify_all();
+  }
+#endif
+}
+
 THETA_FORCE_INLINE void futex_wake_all_u32(
     std::atomic<std::uint32_t>* addr) noexcept {
 #if THETA_OS_LINUX && !THETA_TSAN_ENABLED
@@ -44,6 +72,15 @@ THETA_FORCE_INLINE void futex_wake_all_u32(
   addr->notify_all();
 #endif
 }
+
+#if THETA_OS_LINUX && !THETA_TSAN_ENABLED
+[[nodiscard]] THETA_FORCE_INLINE std::uint64_t mono_now_ns() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+#endif
 
 THETA_FORCE_INLINE void futex_park_u32(std::atomic<std::uint32_t>* addr,
                                        std::uint32_t expected,
@@ -65,6 +102,46 @@ THETA_FORCE_INLINE void futex_park_u32(std::atomic<std::uint32_t>* addr,
   (void)addr;
   (void)expected;
   (void)mode;
+  ::theta::arch::cpu_relax();
+#endif
+}
+
+THETA_FORCE_INLINE void futex_park_adaptive_u32(
+    std::atomic<std::uint32_t>* addr, std::uint32_t expected, std::uint8_t mode,
+    std::atomic<std::uint32_t>& spin_shift) noexcept {
+#if THETA_OS_LINUX && !THETA_TSAN_ENABLED
+  static constexpr struct timespec kBriefParkTimeout{
+      .tv_sec = 0,
+      .tv_nsec = 100'000L,
+  };
+  const std::uint32_t cur_sh = spin_shift.load(std::memory_order_relaxed);
+  const std::uint64_t t0 = mono_now_ns();
+  if (mode == 2U) [[likely]] {
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(addr),
+                    FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+  } else {
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(addr),
+                    FUTEX_WAIT_PRIVATE, expected, &kBriefParkTimeout, nullptr,
+                    0);
+  }
+  const std::uint64_t slept_ns = mono_now_ns() - t0;
+  const std::uint64_t est_spin_ns =
+      750ULL << (cur_sh <= kMaxParkSpinShift ? cur_sh : kMaxParkSpinShift);
+  // Promote to max user-space spin iff `est_spin_ns + slept_ns < 11 us`
+  // (strictly inside `kMaxParkSpinShift`'s ~12-13 us window); otherwise decay
+  // step-by-step down to `~0.8 us` so slower or idle queues never waste CPU.
+  if (est_spin_ns + slept_ns < 11'000ULL) {
+    if (cur_sh != kMaxParkSpinShift) {
+      spin_shift.store(kMaxParkSpinShift, std::memory_order_relaxed);
+    }
+  } else if (cur_sh > 0U) {
+    spin_shift.store(cur_sh - 1U, std::memory_order_relaxed);
+  }
+#else
+  (void)addr;
+  (void)expected;
+  (void)mode;
+  (void)spin_shift;
   ::theta::arch::cpu_relax();
 #endif
 }
@@ -142,7 +219,7 @@ AsymmetricParkLot::get_or_activate_state_slow(
       aligned_free_uninit(fresh);
     }
   }
-  std::uint8_t m = s->mode.load(std::memory_order_acquire);
+  std::uint32_t m = s->mode.load(std::memory_order_acquire);
   if (m < 2U) {
     const ColdSpinGuard guard(s->activate_lock);
     m = s->mode.load(std::memory_order_relaxed);
@@ -153,13 +230,13 @@ AsymmetricParkLot::get_or_activate_state_slow(
       s->mode.store(m, std::memory_order_release);
     }
   }
-  out_mode = m;
+  out_mode = static_cast<std::uint8_t>(m);
   return s;
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::park_epoch(
     AsymmetricParkState* s, std::uint32_t ep, std::uint8_t mode) noexcept {
-  futex_park_u32(&s->epoch, ep, mode);
+  futex_park_adaptive_u32(&s->epoch, ep, mode, s->spin_shift);
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::destroy_state_slow(
@@ -197,7 +274,7 @@ StripedParkLotBase::get_or_activate_state_slow(
       aligned_free_uninit(fresh);
     }
   }
-  std::uint8_t m = s->mode.load(std::memory_order_acquire);
+  std::uint32_t m = s->mode.load(std::memory_order_acquire);
   if (m < 2U) {
     const ColdSpinGuard guard(s->activate_lock);
     m = s->mode.load(std::memory_order_relaxed);
@@ -208,7 +285,7 @@ StripedParkLotBase::get_or_activate_state_slow(
       s->mode.store(m, std::memory_order_release);
     }
   }
-  out_mode = m;
+  out_mode = static_cast<std::uint8_t>(m);
   return s;
 }
 
@@ -221,12 +298,34 @@ StripedParkLotBase::get_or_activate_state_slow(
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void
+StripedParkLotBase::wake_unclaimed_one_slow(StripedParkState* s) noexcept {
+  if (s->unclaimed_waiters.load(std::memory_order_acquire) != 0U) {
+    s->unclaimed_epoch.fetch_add(1U, std::memory_order_acq_rel);
+    futex_wake_one_u32(&s->unclaimed_epoch);
+  }
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void
+StripedParkLotBase::wake_unclaimed_all_slow(StripedParkState* s) noexcept {
+  if (s->unclaimed_waiters.load(std::memory_order_acquire) != 0U) {
+    s->unclaimed_epoch.fetch_add(1U, std::memory_order_acq_rel);
+    futex_wake_all_u32(&s->unclaimed_epoch);
+  }
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void
 StripedParkLotBase::notify_range_active_slow(StripedParkState* state,
                                              std::size_t ring_mask,
                                              std::size_t stripe_mask,
                                              std::uint64_t base_ticket,
                                              std::size_t count) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (state->unclaimed_waiters.load(kParkFastLoadOrder) != 0U &&
+      (count > 1U || state->unclaimed_spinner.load(kParkFastLoadOrder) == 0U))
+      [[unlikely]] {
+    state->unclaimed_epoch.fetch_add(1U, std::memory_order_acq_rel);
+    futex_wake_n_u32(&state->unclaimed_epoch, count);
+  }
   ParkStripe* stripes = state->stripes.data();
   const std::size_t max_unique = std::min(ring_mask + 1U, stripe_mask + 1U);
   const std::size_t n = std::min(count, max_unique);
@@ -247,6 +346,12 @@ StripedParkLotBase::notify_range_active_slow(StripedParkState* state,
 [[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::park_stripe_epoch(
     ParkStripe& stripe, std::uint32_t ep, std::uint8_t mode) noexcept {
   futex_park_u32(&stripe.epoch, ep, mode);
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void
+StripedParkLotBase::park_unclaimed_epoch(StripedParkState* s, std::uint32_t ep,
+                                         std::uint8_t mode) noexcept {
+  futex_park_adaptive_u32(&s->unclaimed_epoch, ep, mode, s->spin_shift);
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::destroy_state_slow(

@@ -126,11 +126,32 @@ inline constexpr std::memory_order kParkFastLoadOrder =
     std::memory_order_relaxed;
 #endif
 
+inline constexpr int kStripeTicketRelaxIters =
+    ::theta::arch::kIsAarch64 ? 1024
+                              : (::theta::arch::kX86VendorAmd ? 224 : 160);
+
+inline constexpr std::uint8_t kMaxParkSpinShift = 4U;
+
+// Adaptive polite spin budget (`shift` in `[0..4]` -> `~0.8 us .. ~13 us`):
+// stays at `kMaxParkSpinShift` while user-space spinning catches sub-11us
+// arrivals (`0` `SYS_futex` syscalls), and decays step-by-step inside
+// `src/queue.cpp` whenever `FUTEX_WAIT` sleeps past the spin window.
+[[nodiscard]] THETA_FORCE_INLINE constexpr int park_relax_budget(
+    std::uint8_t shift) noexcept {
+  constexpr int kBase = ::theta::arch::kIsAarch64
+                            ? 128
+                            : (::theta::arch::kX86VendorAmd ? 36 : 24);
+  const std::uint8_t clamped =
+      shift <= kMaxParkSpinShift ? shift : kMaxParkSpinShift;
+  return kBase << clamped;
+}
+
 struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
   std::atomic<std::uint32_t> waiters{0};
   std::atomic<std::uint32_t> needs_wake{0};
   std::atomic<std::uint32_t> epoch{0};
-  std::atomic<std::uint8_t> mode{1};
+  std::atomic<std::uint32_t> mode{1};
+  std::atomic<std::uint32_t> spin_shift{kMaxParkSpinShift};
   ColdSpinLock activate_lock;
 };
 
@@ -187,7 +208,9 @@ class AsymmetricParkLot {
   [[nodiscard]] static std::uint8_t blocking_mode_slot(
       const std::atomic<AsymmetricParkState*>& slot) noexcept {
     const auto* s = slot.load(std::memory_order_acquire);
-    return s != nullptr ? s->mode.load(std::memory_order_acquire) : 0U;
+    return s != nullptr ? static_cast<std::uint8_t>(
+                              s->mode.load(std::memory_order_acquire))
+                        : 0U;
   }
 
   template <typename StopPred>
@@ -212,7 +235,13 @@ void destroy_spsc_core(void* slots, std::size_t align,
 struct alignas(kHardwareDestructiveInterferenceSize) StripedParkState {
   static constexpr std::size_t kMaxStripes = 16;
 
-  std::atomic<std::uint8_t> mode{1};
+  std::atomic<std::uint32_t> mode{1};
+  std::atomic<std::uint32_t> work_conserving{0};
+  std::atomic<std::uint32_t> spin_shift{kMaxParkSpinShift};
+  std::atomic<std::uint32_t> ticket_waiters{0};
+  std::atomic<std::uint32_t> unclaimed_spinner{0};
+  std::atomic<std::uint32_t> unclaimed_waiters{0};
+  std::atomic<std::uint32_t> unclaimed_epoch{0};
   ColdSpinLock activate_lock;
   std::array<ParkStripe, kMaxStripes> stripes{};
 };
@@ -221,18 +250,26 @@ struct StripedParkLotBase {
   [[gnu::cold]] static StripedParkState* get_or_activate_state_slow(
       std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept;
   [[gnu::cold]] static void wake_stripe_slow(ParkStripe& stripe) noexcept;
+  [[gnu::cold]] static void wake_unclaimed_one_slow(
+      StripedParkState* s) noexcept;
+  [[gnu::cold]] static void wake_unclaimed_all_slow(
+      StripedParkState* s) noexcept;
   [[gnu::cold]] static void notify_range_active_slow(
       StripedParkState* state, std::size_t ring_mask, std::size_t stripe_mask,
       std::uint64_t base_ticket, std::size_t count) noexcept;
   [[gnu::cold]] static void park_stripe_epoch(ParkStripe& stripe,
                                               std::uint32_t ep,
                                               std::uint8_t mode) noexcept;
+  [[gnu::cold]] static void park_unclaimed_epoch(StripedParkState* s,
+                                                 std::uint32_t ep,
+                                                 std::uint8_t mode) noexcept;
   [[gnu::cold]] static void destroy_state_slow(StripedParkState* s) noexcept;
 };
 
-// Compact 8-byte lazy ticket-striped 2-Tier eventcount: eliminates thundering
-// herds, cross-stripe false sharing, ongoing `SYS_membarrier` IPIs, and
-// redundant `FUTEX_WAKE` storms.
+// Compact 8-byte lazy ticket-striped + work-conserving 2-Tier eventcount:
+// eliminates thundering herds, cross-stripe false sharing, ongoing
+// `SYS_membarrier` IPIs, redundant `FUTEX_WAKE` storms, and empty-queue
+// multi-consumer ticket pre-claiming / spin churn.
 template <std::size_t kStripes = 16>
 class StripedParkLot {
   static_assert((kStripes & (kStripes - 1U)) == 0U && kStripes >= 2U &&
@@ -255,12 +292,66 @@ class StripedParkLot {
   StripedParkLot(StripedParkLot&&) = delete;
   StripedParkLot& operator=(StripedParkLot&&) = delete;
 
+  [[nodiscard]] THETA_FORCE_INLINE bool is_work_conserving() const noexcept {
+    const auto* s = state_.load(kParkFastLoadOrder);
+    return s != nullptr && s->work_conserving.load(kParkFastLoadOrder) != 0U;
+  }
+
+  [[nodiscard]] THETA_FORCE_INLINE bool has_unclaimed_waiters() const noexcept {
+    const auto* s = state_.load(kParkFastLoadOrder);
+    return s != nullptr && s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U;
+  }
+
+  THETA_FORCE_INLINE void wake_one_unclaimed() noexcept {
+    if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
+      StripedParkLotBase::wake_unclaimed_one_slow(s);
+    }
+  }
+
+  THETA_FORCE_INLINE void promote_to_flood_mode() noexcept {
+    if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) {
+      if (s->work_conserving.load(kParkFastLoadOrder) != 0U) {
+        s->work_conserving.store(0U, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) {
+          StripedParkLotBase::wake_unclaimed_all_slow(s);
+        }
+      }
+    }
+  }
+
   THETA_FORCE_INLINE void notify_ticket(std::uint64_t ticket) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
       std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+        StripedParkLotBase::wake_unclaimed_one_slow(s);
+      }
       ParkStripe& stripe =
           s->stripes[static_cast<std::size_t>(ticket) & kStripeMask];
+      if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+        StripedParkLotBase::wake_stripe_slow(stripe);
+      }
+    }
+  }
+
+  template <typename HeadAtomic>
+  THETA_FORCE_INLINE void notify_consumer_ticket(
+      std::size_t ring_slot, std::uint64_t pos,
+      const HeadAtomic& head) noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+        // Elide `FUTEX_WAKE(1)` only when `unclaimed_spinner` is actively
+        // watching `head` (before `head` advances) AND `pos == head` (no older
+        // queued item proving spinner preemption or >= 2-item burst).
+        if (s->unclaimed_spinner.load(kParkFastLoadOrder) == 0U ||
+            pos != head.load(kParkFastLoadOrder)) {
+          StripedParkLotBase::wake_unclaimed_one_slow(s);
+        }
+      }
+      ParkStripe& stripe = s->stripes[ring_slot & kStripeMask];
       if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
         StripedParkLotBase::wake_stripe_slow(stripe);
       }
@@ -279,12 +370,19 @@ class StripedParkLot {
 
   [[nodiscard]] std::uint8_t blocking_mode() const noexcept {
     const auto* s = state_.load(std::memory_order_acquire);
-    return s != nullptr ? s->mode.load(std::memory_order_acquire) : 0U;
+    return s != nullptr ? static_cast<std::uint8_t>(
+                              s->mode.load(std::memory_order_acquire))
+                        : 0U;
   }
 
   template <typename StopPred>
-  THETA_ALIGNED_NOINLINE void wait_ticket(std::uint64_t ticket,
-                                          StopPred&& pred) noexcept;
+  THETA_ALIGNED_NOINLINE void wait_ticket(
+      std::uint64_t ticket, StopPred&& pred,
+      bool enable_work_conserving = false) noexcept;
+
+  template <typename TryClaimFn, typename HasReadyFn>
+  THETA_ALIGNED_NOINLINE void wait_unclaimed(TryClaimFn&& try_claim,
+                                             HasReadyFn&& has_ready) noexcept;
 
  private:
   std::atomic<StripedParkState*> state_{nullptr};

@@ -1368,5 +1368,157 @@ TEST(ConventionsAndPeerTest, BurstWakeCoalescingAndMultiSleeperConservation) {
   verify_tight_mpmc(strict_q);
 }
 
+TEST(ConventionsAndPeerTest,
+     WorkConservingMPMCBatonFloodTransitionAndSigprofResilience) {
+  // 1. Adaptive spin_shift decay on > 25 us sleeps and promotion on fast wakes.
+  {
+    SPSCQueue<uint64_t, 16> spsc;
+    for (uint64_t i = 1U; i <= 8U; ++i) {
+      std::thread prod([&, i]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        spsc.push(i);
+      });
+      EXPECT_EQ(spsc.pop(), i);
+      prod.join();
+    }
+    if constexpr (!arch::kTsanEnabled) {
+      EXPECT_EQ(queue::detail::QueueTestPeer::spsc_cons_spin_shift(spsc), 0U);
+    }
+  }
+
+  // 2. Work-conserving MPMCQueue consumer parking + flood-mode oscillation
+  //    under active 4 kHz ITIMER_PROF (`SIGPROF` `-EINTR` interruptions).
+  MPMCQueue<uint64_t, 256> q;
+  EXPECT_FALSE(queue::detail::QueueTestPeer::mpmc_cons_work_conserving(q));
+
+#if defined(__linux__) && !THETA_TSAN_ENABLED
+  struct sigaction sa{};
+  struct sigaction old_sa{};
+  sa.sa_handler = [](int) {};
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  const bool sig_installed = (sigaction(SIGPROF, &sa, &old_sa) == 0);
+  itimerval prof_timer{};
+  prof_timer.it_interval.tv_usec = 250;
+  prof_timer.it_value.tv_usec = 250;
+  if (sig_installed) {
+    (void)setitimer(ITIMER_PROF, &prof_timer, nullptr);
+  }
+#endif
+
+  constexpr int kConsumers = 4;
+  constexpr int kProducers = 2;
+  constexpr int kPhases = arch::kTsanEnabled ? 8 : 24;
+  constexpr std::size_t kTricklePerProd = 16;
+  constexpr std::size_t kFloodPerProd = 96;
+  constexpr std::size_t kTotalItems =
+      static_cast<std::size_t>(kPhases * kProducers) *
+      (kTricklePerProd + kFloodPerProd);
+
+  std::atomic<std::size_t> popped_count{0};
+  std::atomic<uint64_t> cons_sum{0};
+  std::atomic<uint64_t> prod_sum{0};
+
+  std::vector<std::thread> consumers;
+  consumers.reserve(kConsumers);
+  for (int c = 0; c < kConsumers; ++c) {
+    consumers.emplace_back([&, c]() {
+      uint64_t local_sum = 0U;
+      for (;;) {
+        uint64_t v = 0U;
+        if ((c & 1) == 0) {
+          v = q.pop();
+        } else {
+          q.pop(v);
+        }
+        if (v == 0U) {
+          break;
+        }
+        local_sum += v;
+        popped_count.fetch_add(1U, std::memory_order_release);
+      }
+      cons_sum.fetch_add(local_sum, std::memory_order_relaxed);
+    });
+  }
+
+  // Allow all 4 consumers to hit empty and transition `work_conserving -> 1`.
+  const auto wc_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!queue::detail::QueueTestPeer::mpmc_cons_work_conserving(q) &&
+         std::chrono::steady_clock::now() < wc_deadline) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  EXPECT_TRUE(queue::detail::QueueTestPeer::mpmc_cons_work_conserving(q));
+
+  std::vector<std::thread> producers;
+  producers.reserve(kProducers);
+  for (int p = 0; p < kProducers; ++p) {
+    producers.emplace_back([&, p]() {
+      uint64_t local_sum = 0U;
+      uint64_t seq = static_cast<uint64_t>(p + 1) * 1'000'000ULL;
+      for (int ph = 0; ph < kPhases; ++ph) {
+        // Trickle phase: open-loop spacing (~4 us) exercises 1-spinner +
+        // unclaimed-sleeper `FUTEX_WAKE(1)` baton handoff without pre-claiming.
+        for (std::size_t i = 0; i < kTricklePerProd; ++i) {
+          const auto t_end =
+              std::chrono::steady_clock::now() + std::chrono::microseconds(4);
+          while (std::chrono::steady_clock::now() < t_end) {
+            arch::cpu_relax();
+          }
+          const uint64_t v = ++seq;
+          q.push(v);
+          local_sum += v;
+        }
+        // Flood phase: pushes 96 items back-to-back (including `try_push_bulk`)
+        // to exercise `work_conserving: 1 -> 0 -> 1` mode oscillation.
+        std::array<uint64_t, 16> bulk_buf{};
+        for (uint64_t& slot : bulk_buf) {
+          slot = ++seq;
+          local_sum += slot;
+        }
+        std::size_t pushed_bulk = 0U;
+        while (pushed_bulk < bulk_buf.size()) {
+          pushed_bulk += q.try_push_bulk(bulk_buf.data() + pushed_bulk,
+                                         bulk_buf.size() - pushed_bulk);
+        }
+        for (std::size_t i = bulk_buf.size(); i < kFloodPerProd; ++i) {
+          const uint64_t v = ++seq;
+          q.push(v);
+          local_sum += v;
+        }
+        if ((ph & 3) == 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(150));
+        }
+      }
+      prod_sum.fetch_add(local_sum, std::memory_order_relaxed);
+    });
+  }
+
+  for (auto& t : producers) {
+    t.join();
+  }
+  while (popped_count.load(std::memory_order_acquire) < kTotalItems) {
+    std::this_thread::yield();
+  }
+  for (int c = 0; c < kConsumers; ++c) {
+    q.push(0U);
+  }
+  for (auto& t : consumers) {
+    t.join();
+  }
+
+#if defined(__linux__) && !THETA_TSAN_ENABLED
+  if (sig_installed) {
+    itimerval stop_timer{};
+    (void)setitimer(ITIMER_PROF, &stop_timer, nullptr);
+    (void)sigaction(SIGPROF, &old_sa, nullptr);
+  }
+#endif
+
+  EXPECT_EQ(popped_count.load(), kTotalItems);
+  EXPECT_EQ(cons_sum.load(), prod_sum.load());
+  EXPECT_TRUE(q.empty());
+}
+
 }  // namespace
 }  // namespace theta
