@@ -5,6 +5,12 @@
 #include <gtest/gtest.h>
 #include <sched.h>
 #include <sys/time.h>
+#if defined(__linux__)
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -1518,6 +1524,63 @@ TEST(ConventionsAndPeerTest,
   EXPECT_EQ(popped_count.load(), kTotalItems);
   EXPECT_EQ(cons_sum.load(), prod_sum.load());
   EXPECT_TRUE(q.empty());
+}
+
+TEST(ConventionsAndPeerTest, EagerMembarrierInitAndForkReRegistration) {
+#if defined(__linux__) && !THETA_TSAN_ENABLED
+  using queue::detail::QueueTestPeer;
+
+  // 1. `.init_array.00101` must have already registered `PRIVATE_EXPEDITED`
+  //    (and `PRIVATE_EXPEDITED_RSEQ`) while `nr_threads == 1`, so an expedited
+  //    membarrier succeeds immediately without `-EPERM` or `synchronize_rcu()`.
+  ASSERT_EQ(::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0),
+            0);
+#if THETA_HAS_LINUX_RSEQ && !THETA_QUEUE_SANITIZED
+  ASSERT_EQ(
+      ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, 0),
+      0);
+#endif
+
+  // 2. Across `fork()`, Linux `copy_mm()` clears `mm->membarrier_state` in the
+  //    child; `pthread_atfork`'s child handler must re-register eagerly while
+  //    `nr_threads == 1` in the child before any worker threads spawn.
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    if (::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) !=
+        0) {
+      ::_exit(1);
+    }
+#if THETA_HAS_LINUX_RSEQ && !THETA_QUEUE_SANITIZED
+    if (::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0,
+                  0) != 0) {
+      ::_exit(2);
+    }
+#endif
+    MPMCQueue<uint64_t, 16> child_q{};
+    uint64_t got = 0;
+    std::thread cons([&]() { got = child_q.pop(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (QueueTestPeer::mpmc_cons_blocking_mode(child_q) < 2U &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    child_q.push(42U);
+    cons.join();
+    if (got != 42U || QueueTestPeer::mpmc_cons_blocking_mode(child_q) != 2U) {
+      ::_exit(3);
+    }
+    ::_exit(0);
+  }
+
+  int status = 0;
+  ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+#else
+  GTEST_SKIP() << "Linux non-TSan SYS_membarrier test";
+#endif
 }
 
 }  // namespace

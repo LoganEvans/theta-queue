@@ -16,9 +16,12 @@
 #if THETA_OS_LINUX
 #include <linux/futex.h>
 #include <linux/membarrier.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#include <cerrno>
 #endif
 
 namespace theta::queue::detail {
@@ -30,10 +33,39 @@ namespace {
 
 #if THETA_OS_LINUX && !THETA_TSAN_ENABLED
 constinit std::atomic<std::uint8_t> g_membarrier_exp_state{0};
+constinit ColdSpinLock g_membarrier_reg_lock{};
 #endif
 
 #if THETA_OS_LINUX && THETA_HAS_LINUX_RSEQ && !THETA_QUEUE_SANITIZED
 constinit std::atomic<std::uint8_t> g_membarrier_rseq_state{0};
+#endif
+
+#if THETA_OS_LINUX && !THETA_TSAN_ENABLED
+// Eagerly registers `PRIVATE_EXPEDITED` (and `PRIVATE_EXPEDITED_RSEQ`) while
+// `mm->mm_users == 1 && get_nr_threads(p) == 1` (`~12 us`, avoiding Linux
+// `membarrier_register_private_expedited`'s `~5.9 ms` `synchronize_rcu()` stall
+// once worker threads exist) both at `.init_array.00101` startup and in the
+// child immediately after `fork()` (`copy_mm` clears `mm->membarrier_state`).
+[[gnu::noinline, gnu::aligned(64)]] void
+register_queue_membarrier_current_mm() noexcept {
+  const bool exp_ok =
+      ::syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0,
+                0) == 0;
+  g_membarrier_exp_state.store(exp_ok ? 1U : 2U, std::memory_order_release);
+#if THETA_HAS_LINUX_RSEQ && !THETA_QUEUE_SANITIZED
+  const bool rseq_ok =
+      ::syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ,
+                0, 0) == 0;
+  g_membarrier_rseq_state.store(rseq_ok ? 1U : 2U, std::memory_order_release);
+#endif
+}
+
+[[gnu::constructor(101), gnu::used, gnu::aligned(64)]] void
+eager_register_queue_membarrier() noexcept {
+  register_queue_membarrier_current_mm();
+  (void)::pthread_atfork(nullptr, nullptr,
+                         &register_queue_membarrier_current_mm);
+}
 #endif
 
 THETA_FORCE_INLINE void futex_wake_one_u32(
@@ -161,17 +193,28 @@ current_cpu_os_fallback() noexcept {
 [[gnu::noinline, gnu::aligned(64)]] bool
 asymmetric_membarrier_expedited() noexcept {
 #if THETA_OS_LINUX && !THETA_TSAN_ENABLED
-  std::uint8_t st = g_membarrier_exp_state.load(std::memory_order_relaxed);
+  std::uint8_t st = g_membarrier_exp_state.load(std::memory_order_acquire);
+  if (st == 1U) [[likely]] {
+    if (::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0)
+        [[likely]] {
+      return true;
+    }
+    if (errno != EPERM) {
+      return false;
+    }
+    st = 0U;
+  }
   if (st == 0U) [[unlikely]] {
+    const ColdSpinGuard guard(g_membarrier_reg_lock);
     const bool ok =
         ::syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0,
                   0) == 0;
     st = ok ? 1U : 2U;
-    g_membarrier_exp_state.store(st, std::memory_order_relaxed);
-  }
-  if (st == 1U) [[likely]] {
-    return ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) ==
-           0;
+    g_membarrier_exp_state.store(st, std::memory_order_release);
+    if (ok) {
+      return ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0,
+                       0) == 0;
+    }
   }
 #endif
   return false;
@@ -180,17 +223,28 @@ asymmetric_membarrier_expedited() noexcept {
 [[gnu::noinline, gnu::aligned(64)]] bool
 asymmetric_membarrier_rseq_expedited() noexcept {
 #if THETA_OS_LINUX && THETA_HAS_LINUX_RSEQ && !THETA_QUEUE_SANITIZED
-  std::uint8_t st = g_membarrier_rseq_state.load(std::memory_order_relaxed);
+  std::uint8_t st = g_membarrier_rseq_state.load(std::memory_order_acquire);
+  if (st == 1U) [[likely]] {
+    if (::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0,
+                  0) == 0) [[likely]] {
+      return true;
+    }
+    if (errno != EPERM) {
+      return false;
+    }
+    st = 0U;
+  }
   if (st == 0U) [[unlikely]] {
+    const ColdSpinGuard guard(g_membarrier_reg_lock);
     const bool ok =
         ::syscall(SYS_membarrier,
                   MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0) == 0;
     st = ok ? 1U : 2U;
-    g_membarrier_rseq_state.store(st, std::memory_order_relaxed);
-  }
-  if (st == 1U) [[likely]] {
-    return ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0,
-                     0) == 0;
+    g_membarrier_rseq_state.store(st, std::memory_order_release);
+    if (ok) {
+      return ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0,
+                       0) == 0;
+    }
   }
 #endif
   return false;
