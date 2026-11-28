@@ -170,11 +170,12 @@ class SPSCQueue {
     if (next == head_cache_) [[unlikely]] {
       head_cache_ = head_.load(std::memory_order_acquire);
       if (next == head_cache_) {
+        const std::atomic<std::size_t>* const head_ptr = &head_;
         queue::detail::AsymmetricParkLot::wait_slot_until(
-            prod_park_, [this, next]() noexcept {
-              head_cache_ = head_.load(std::memory_order_acquire);
-              return next != head_cache_;
+            prod_park_, [head_ptr, next]() noexcept {
+              return head_ptr->load(std::memory_order_acquire) != next;
             });
+        head_cache_ = head_.load(std::memory_order_acquire);
       }
     }
     slots_[t].construct(std::forward<Args>(args)...);
@@ -313,11 +314,12 @@ class SPSCQueue {
     if (h == tail_cache_) {
       tail_cache_ = tail_.load(std::memory_order_acquire);
       if (h == tail_cache_) {
+        const std::atomic<std::size_t>* const tail_ptr = &tail_;
         queue::detail::AsymmetricParkLot::wait_slot_until(
-            cons_park_, [this, h]() noexcept {
-              tail_cache_ = tail_.load(std::memory_order_acquire);
-              return h != tail_cache_;
+            cons_park_, [tail_ptr, h]() noexcept {
+              return tail_ptr->load(std::memory_order_acquire) != h;
             });
+        tail_cache_ = tail_.load(std::memory_order_acquire);
       }
     }
     T out{slots_[h].move_and_destroy()};

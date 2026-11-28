@@ -43,6 +43,20 @@ struct ArchBackend {
 
   static THETA_FORCE_INLINE void stlf_micro_pause() noexcept { cpu_relax(); }
 
+  // Paces Stage-2 user-space spin loops on AArch64 (`yield` is a 1-cycle NOP on
+  // Neoverse-N1/V2, expiring 1024 iterations in ~340 ns). `isb` flushes the
+  // pipeline frontend cleanly in ~20-30 cycles (~8-10 ns) without `wfe` EL2
+  // hypervisor VMEXIT traps (`HCR_EL2.TWE`) or exclusive-monitor contention.
+  static THETA_FORCE_INLINE void polite_relax() noexcept {
+#if defined(__clang__)
+    __builtin_arm_isb(15);
+#else
+    // WHY ASM: (b) ISA instruction (`isb`) unavailable via header-free GCC
+    // builtin, pacing Stage-2 AArch64 spin loops (~8-10 ns vs 1-cycle `yield`).
+    asm volatile("isb" ::: "memory");
+#endif
+  }
+
   static THETA_FORCE_INLINE void prefetch_for_write(const void* addr) noexcept {
     __builtin_prefetch(addr, 1, 3);
   }

@@ -1583,5 +1583,142 @@ TEST(ConventionsAndPeerTest, EagerMembarrierInitAndForkReRegistration) {
 #endif
 }
 
+TEST(ConventionsAndPeerTest, ParkFenceDisarmHysteresisAndReArmConservation) {
+  using queue::detail::QueueTestPeer;
+
+  // 1. SPSCQueue (`AsymmetricParkLot`): initial sleep arms fence (`true`),
+  //    active ping-pong spin catches disarm fence (`false` when `mode == 2`),
+  //    and a subsequent > 1 ms idle sleep cleanly re-arms fence (`true`).
+  {
+    SPSCQueue<uint64_t, 64> q{};
+    SPSCQueue<uint64_t, 64> ack{};
+    EXPECT_FALSE(QueueTestPeer::spsc_cons_fence_armed(q));
+
+    // Phase A: force initial park (> spin window).
+    {
+      uint64_t got = 0;
+      std::thread cons([&]() { got = q.pop(); });
+      while (QueueTestPeer::spsc_cons_blocking_mode(q) < 2U) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+      EXPECT_TRUE(QueueTestPeer::spsc_cons_fence_armed(q));
+      q.push(1U);
+      cons.join();
+      EXPECT_EQ(got, 1U);
+    }
+
+    // Phase B: tight blocking ping-pong (>= 64 uninterrupted slow-path spin
+    // catches) disarms `sleep_state` when `SYS_membarrier` (`mode == 2`) is
+    // active, resilient to mid-batch CFS preemptions under host load.
+    {
+      constexpr uint64_t kStop = UINT64_MAX;
+      std::barrier ready(2);
+      std::thread echo([&]() {
+        ready.arrive_and_wait();
+        for (;;) {
+          const uint64_t v = q.pop();
+          if (v == kStop) {
+            break;
+          }
+          ack.push(v);
+        }
+      });
+      ready.arrive_and_wait();
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      uint64_t seq = 0U;
+      while (std::chrono::steady_clock::now() < deadline) {
+        for (uint64_t b = 0U; b < 128U; ++b) {
+          for (int k = 0; k < 16; ++k) {
+            arch::cpu_relax();
+          }
+          ++seq;
+          q.push(seq);
+          EXPECT_EQ(ack.pop(), seq);
+        }
+        if (QueueTestPeer::spsc_cons_blocking_mode(q) != 2U ||
+            !QueueTestPeer::spsc_cons_fence_armed(q)) {
+          break;
+        }
+      }
+      if (QueueTestPeer::spsc_cons_blocking_mode(q) == 2U) {
+        EXPECT_FALSE(QueueTestPeer::spsc_cons_fence_armed(q));
+      }
+      q.push(kStop);
+      echo.join();
+    }
+
+    // Phase C: subsequent genuine idle park cleanly re-arms via membarrier.
+    {
+      uint64_t got = 0;
+      std::thread cons([&]() { got = q.pop(); });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!QueueTestPeer::spsc_cons_fence_armed(q) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+      EXPECT_TRUE(QueueTestPeer::spsc_cons_fence_armed(q));
+      q.push(99U);
+      cons.join();
+      EXPECT_EQ(got, 99U);
+    }
+  }
+
+  // 2. MPMCQueue (`StripedParkLot`): alternating tight spin-caught bursts and
+  //    idle parks across multiple threads preserves 100% item conservation and
+  //    disarm/re-arm transitions with zero lost wakeups.
+  {
+    MPMCQueue<uint64_t, 64> q{};
+    MPMCQueue<uint64_t, 64> ack{};
+    {
+      uint64_t got = 0;
+      std::thread cons([&]() { got = q.pop(); });
+      while (QueueTestPeer::mpmc_cons_blocking_mode(q) < 2U) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+      EXPECT_TRUE(QueueTestPeer::mpmc_cons_fence_armed(q));
+      q.push(7U);
+      cons.join();
+      EXPECT_EQ(got, 7U);
+    }
+
+    constexpr int kEpochs = arch::kTsanEnabled ? 6 : 16;
+    constexpr uint64_t kBurstTurns = 256U;
+    for (int ep = 0; ep < kEpochs; ++ep) {
+      std::barrier ready(2);
+      std::thread echo([&]() {
+        ready.arrive_and_wait();
+        for (uint64_t i = 1U; i <= kBurstTurns; ++i) {
+          ack.push(q.pop());
+        }
+      });
+      ready.arrive_and_wait();
+      for (uint64_t i = 1U; i <= kBurstTurns; ++i) {
+        for (int k = 0; k < 16; ++k) {
+          arch::cpu_relax();
+        }
+        q.push(i);
+        ASSERT_EQ(ack.pop(), i);
+      }
+      echo.join();
+
+      // Force a real park after disarming to exercise concurrent re-arming.
+      std::atomic<uint64_t> sum{0};
+      std::thread c0(
+          [&]() { sum.fetch_add(q.pop(), std::memory_order_relaxed); });
+      std::thread c1(
+          [&]() { sum.fetch_add(q.pop(), std::memory_order_relaxed); });
+      std::this_thread::sleep_for(std::chrono::microseconds(400));
+      q.push(11U);
+      q.push(29U);
+      c0.join();
+      c1.join();
+      ASSERT_EQ(sum.load(), 40U);
+      EXPECT_TRUE(QueueTestPeer::mpmc_cons_fence_armed(q));
+    }
+  }
+}
+
 }  // namespace
 }  // namespace theta

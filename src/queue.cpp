@@ -260,7 +260,7 @@ asymmetric_membarrier_rseq_expedited() noexcept {
 
 [[gnu::noinline, gnu::aligned(64)]] AsymmetricParkState*
 AsymmetricParkLot::get_or_activate_state_slow(
-    std::atomic<AsymmetricParkState*>& slot, std::uint8_t& out_mode) noexcept {
+    std::atomic<AsymmetricParkState*>& slot) noexcept {
   AsymmetricParkState* s = slot.load(std::memory_order_acquire);
   if (s == nullptr) {
     auto* fresh = aligned_alloc_uninit<AsymmetricParkState>(1U);
@@ -284,8 +284,24 @@ AsymmetricParkLot::get_or_activate_state_slow(
       s->mode.store(m, std::memory_order_release);
     }
   }
-  out_mode = static_cast<std::uint8_t>(m);
   return s;
+}
+
+[[gnu::noinline, gnu::aligned(64)]] std::uint8_t
+AsymmetricParkLot::arm_fence_slow(AsymmetricParkState* s) noexcept {
+  const ColdSpinGuard guard(s->activate_lock);
+  std::uint32_t m = s->mode.load(std::memory_order_relaxed);
+  if ((s->sleep_state.load(std::memory_order_relaxed) & kParkFenceReadyBit) ==
+      0U) {
+    s->sleep_state.fetch_or(kParkFenceArmedBit, std::memory_order_seq_cst);
+    const bool ok = asymmetric_membarrier_expedited();
+    if (!ok) [[unlikely]] {
+      m = 3U;
+      s->mode.store(3U, std::memory_order_release);
+    }
+    s->sleep_state.fetch_or(kParkFenceReadyBit, std::memory_order_release);
+  }
+  return static_cast<std::uint8_t>(m);
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void AsymmetricParkLot::park_epoch(
@@ -315,7 +331,7 @@ AsymmetricParkLot::get_or_activate_state_slow(
 
 [[gnu::noinline, gnu::aligned(64)]] StripedParkState*
 StripedParkLotBase::get_or_activate_state_slow(
-    std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept {
+    std::atomic<StripedParkState*>& slot) noexcept {
   StripedParkState* s = slot.load(std::memory_order_acquire);
   if (s == nullptr) {
     auto* fresh = aligned_alloc_uninit<StripedParkState>(1U);
@@ -339,8 +355,74 @@ StripedParkLotBase::get_or_activate_state_slow(
       s->mode.store(m, std::memory_order_release);
     }
   }
-  out_mode = static_cast<std::uint8_t>(m);
   return s;
+}
+
+[[gnu::noinline, gnu::aligned(64)]] std::uint8_t
+StripedParkLotBase::arm_fence_slow(StripedParkState* s) noexcept {
+  const ColdSpinGuard guard(s->activate_lock);
+  std::uint32_t m = s->mode.load(std::memory_order_relaxed);
+  if ((s->fence_state.load(std::memory_order_relaxed) & kParkFenceReadyBit) ==
+      0U) {
+    s->fence_state.store(kParkFenceArmedBit, std::memory_order_seq_cst);
+    const bool ok = asymmetric_membarrier_expedited();
+    if (!ok) [[unlikely]] {
+      m = 3U;
+      s->mode.store(3U, std::memory_order_release);
+    }
+    s->fence_state.store(kParkFenceBothBits, std::memory_order_release);
+  }
+  return static_cast<std::uint8_t>(m);
+}
+
+[[gnu::noinline, gnu::aligned(64)]] void
+StripedParkLotBase::try_disarm_fence_slow(StripedParkState* s) noexcept {
+  s->spin_catches.store(0U, std::memory_order_relaxed);
+  const ColdSpinGuard guard(s->activate_lock);
+  if (s->mode.load(std::memory_order_relaxed) != 2U ||
+      s->fence_state.load(std::memory_order_relaxed) != kParkFenceBothBits ||
+      s->unclaimed_waiters.load(std::memory_order_acquire) != 0U) {
+    return;
+  }
+  THETA_SCALAR_LOOP
+  for (std::size_t i = 0; i < StripedParkState::kMaxStripes; ++i) {
+    if (s->stripes[i].waiters.load(std::memory_order_acquire) != 0U) {
+      return;
+    }
+  }
+  s->fence_state.store(0U, std::memory_order_seq_cst);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  bool raced = (s->unclaimed_waiters.load(std::memory_order_acquire) != 0U);
+  if (!raced) {
+    THETA_SCALAR_LOOP
+    for (std::size_t i = 0; i < StripedParkState::kMaxStripes; ++i) {
+      if (s->stripes[i].waiters.load(std::memory_order_acquire) != 0U) {
+        raced = true;
+        break;
+      }
+    }
+  }
+  if (raced) [[unlikely]] {
+    s->fence_state.store(kParkFenceArmedBit, std::memory_order_seq_cst);
+    const bool ok = asymmetric_membarrier_expedited();
+    if (!ok) [[unlikely]] {
+      s->mode.store(3U, std::memory_order_release);
+    }
+    s->fence_state.store(kParkFenceBothBits, std::memory_order_release);
+    if (s->unclaimed_waiters.load(std::memory_order_acquire) != 0U) {
+      s->unclaimed_epoch.fetch_add(1U, std::memory_order_acq_rel);
+      futex_wake_all_u32(&s->unclaimed_epoch);
+    }
+    THETA_SCALAR_LOOP
+    for (std::size_t i = 0; i < StripedParkState::kMaxStripes; ++i) {
+      if (s->stripes[i].waiters.load(std::memory_order_acquire) != 0U) {
+        (void)s->stripes[i].needs_wake.exchange(0U, std::memory_order_acq_rel);
+        s->stripes[i].epoch.fetch_add(1U, std::memory_order_acq_rel);
+        futex_wake_all_u32(&s->stripes[i].epoch);
+      }
+    }
+  }
 }
 
 [[gnu::noinline, gnu::aligned(64)]] void StripedParkLotBase::wake_stripe_slow(
@@ -427,6 +509,7 @@ StripedParkLotBase::park_unclaimed_epoch(StripedParkState* s, std::uint32_t ep,
     meta[i].data_cons = lane_buf + (i * cap);
     meta[i].mask_cons = m;
     meta[i].cons_exclusive = multi_consumer ? 1U : 0U;
+    meta[i].cons_steal_ready = multi_consumer ? 0U : 1U;
   }
   (void)asymmetric_membarrier_rseq_expedited();
 }
@@ -451,6 +534,7 @@ StripedParkLotBase::park_unclaimed_epoch(StripedParkState* s, std::uint32_t ep,
     meta[i].data_cons = lt;
     meta[i].mask_cons = m;
     meta[i].cons_exclusive = multi_consumer ? 1U : 0U;
+    meta[i].cons_steal_ready = multi_consumer ? 0U : 1U;
   }
   (void)asymmetric_membarrier_rseq_expedited();
 }
@@ -616,18 +700,21 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
       continue;
     }
 
-    if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_ACQUIRE) != 0U) {
+    if (__atomic_load_n(&m.cons_steal_ready, __ATOMIC_ACQUIRE) == 0U) {
       // Never self-demote our own exclusive home lane!
-      if (self_target != 0U &&
+      if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_ACQUIRE) != 0U &&
+          self_target != 0U &&
           __atomic_load_n(&cons_cam[idx + 1U], __ATOMIC_RELAXED) ==
               self_target) {
         return -1;
       }
       const ColdSpinGuard guard(cam_lock);
-      if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_RELAXED) != 0U) {
-        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
-        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_RELEASE);
+      if (__atomic_load_n(&m.cons_steal_ready, __ATOMIC_RELAXED) == 0U) {
+        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_SEQ_CST);
         (void)asymmetric_membarrier_rseq_expedited();
+        __atomic_store_n(&m.cons_steal_ready, std::uint8_t{1},
+                         __ATOMIC_RELEASE);
       }
     }
 
@@ -672,17 +759,20 @@ RseqLaneCore::try_assign_cons_slot_slow() noexcept {
       continue;
     }
 
-    if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_ACQUIRE) != 0U) {
-      if (self_target != 0U &&
+    if (__atomic_load_n(&m.cons_steal_ready, __ATOMIC_ACQUIRE) == 0U) {
+      if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_ACQUIRE) != 0U &&
+          self_target != 0U &&
           __atomic_load_n(&cons_cam[idx + 1U], __ATOMIC_RELAXED) ==
               self_target) {
         return -1;
       }
       const ColdSpinGuard guard(cam_lock);
-      if (__atomic_load_n(&m.cons_exclusive, __ATOMIC_RELAXED) != 0U) {
-        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_RELEASE);
-        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_RELEASE);
+      if (__atomic_load_n(&m.cons_steal_ready, __ATOMIC_RELAXED) == 0U) {
+        __atomic_store_n(&cons_biased, std::uint8_t{0}, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&m.cons_exclusive, std::uint8_t{0}, __ATOMIC_SEQ_CST);
         (void)asymmetric_membarrier_rseq_expedited();
+        __atomic_store_n(&m.cons_steal_ready, std::uint8_t{1},
+                         __ATOMIC_RELEASE);
       }
     }
 

@@ -126,32 +126,62 @@ inline constexpr std::memory_order kParkFastLoadOrder =
     std::memory_order_relaxed;
 #endif
 
+// Stage-1 ultra-low-latency spin (`stlf_micro_pause` on x86-64 covering
+// ~220-280 ns without 64-140 cycle `pause` quantization; 1-cycle `yield` on
+// AArch64 covering ~170-250 ns before Stage-2 `isb` avoids MSHR snoop flood).
+inline constexpr int kFastSpinIters = ::theta::arch::kIsAarch64 ? 512 : 64;
+
+// Stage-2 polite spin (`pause` on x86-64; ~8-10 ns `isb` on AArch64 -> ~4.5-5.5
+// us total spin window, bridging cloud-mesh cross-core jitter without `futex`).
 inline constexpr int kStripeTicketRelaxIters =
-    ::theta::arch::kIsAarch64 ? 1024
+    ::theta::arch::kIsAarch64 ? 512
                               : (::theta::arch::kX86VendorAmd ? 224 : 160);
 
 inline constexpr std::uint8_t kMaxParkSpinShift = 4U;
 
-// Adaptive polite spin budget (`shift` in `[0..4]` -> `~0.8 us .. ~13 us`):
-// stays at `kMaxParkSpinShift` while user-space spinning catches sub-11us
-// arrivals (`0` `SYS_futex` syscalls), and decays step-by-step inside
-// `src/queue.cpp` whenever `FUTEX_WAIT` sleeps past the spin window.
+// Packed `sleep_state` / `fence_state` bits:
+// - `kParkFenceArmedBit` (`1`): fast-path wakers issue `seq_cst` StoreLoad
+//   fence before checking `needs_wake` / `unclaimed_waiters`.
+// - `kParkFenceReadyBit` (`2`): set after `SYS_membarrier` completes so
+//   concurrent sleepers wait on `activate_lock` until prior waker store buffers
+//   have drained.
+// - After `kParkDisarmSpinCatches` consecutive user-space spin catches with 0
+//   active sleepers (`mode == 2`), `fence_state` disarms to `0` (`0` `mfence` /
+//   `dmb ish` in steady state) and re-arms via `SYS_membarrier` only if a
+//   thread actually sleeps again.
+inline constexpr std::uint32_t kParkFenceArmedBit = 1U;
+inline constexpr std::uint32_t kParkFenceReadyBit = 2U;
+inline constexpr std::uint32_t kParkFenceBothBits =
+    kParkFenceArmedBit | kParkFenceReadyBit;
+inline constexpr std::uint32_t kParkOneSleeper = 4U;
+inline constexpr std::uint32_t kParkDisarmSpinCatches = 64U;
+
+// Adaptive polite spin budget (`shift` in `[0..4]` -> `~0.8 us .. ~13 us` on
+// both x86 `pause` and AArch64 `isb`): stays at `kMaxParkSpinShift` while
+// user-space spinning catches sub-11us arrivals (`0` `SYS_futex` syscalls), and
+// decays step-by-step inside `src/queue.cpp` whenever `FUTEX_WAIT` sleeps past
+// the spin window.
 [[nodiscard]] THETA_FORCE_INLINE constexpr int park_relax_budget(
     std::uint8_t shift) noexcept {
-  constexpr int kBase = ::theta::arch::kIsAarch64
-                            ? 128
-                            : (::theta::arch::kX86VendorAmd ? 36 : 24);
+  constexpr int kBase =
+      ::theta::arch::kIsAarch64 ? 96 : (::theta::arch::kX86VendorAmd ? 36 : 24);
   const std::uint8_t clamped =
       shift <= kMaxParkSpinShift ? shift : kMaxParkSpinShift;
   return kBase << clamped;
 }
 
+template <typename P>
+inline constexpr bool kPassPredByVal =
+    std::is_trivially_copyable_v<std::remove_cvref_t<P>> &&
+    (sizeof(std::remove_cvref_t<P>) <= 16U);
+
 struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
-  std::atomic<std::uint32_t> waiters{0};
+  std::atomic<std::uint32_t> sleep_state{kParkFenceBothBits};
   std::atomic<std::uint32_t> needs_wake{0};
   std::atomic<std::uint32_t> epoch{0};
   std::atomic<std::uint32_t> mode{1};
   std::atomic<std::uint32_t> spin_shift{kMaxParkSpinShift};
+  std::atomic<std::uint32_t> spin_catches{0};
   ColdSpinLock activate_lock;
 };
 
@@ -160,11 +190,9 @@ struct alignas(kHardwareDestructiveInterferenceSize) AsymmetricParkState {
 //   frameless pointer test (`0` `LOCK`s, `0` `StoreLoad` fences, `0` `asm`,
 //   `0` heap allocs, and never escapes `&this` so unescaped local queues stay
 //   100% SROA-promotable into registers).
-// - Tier 2 (`state_ != nullptr`, allocated & promoted once via a single
-//   `SYS_membarrier` on the very first park): inline `seq_cst` StoreLoad fence
-//   + clean `Shared`-state `needs_wake` read (`0` `CALL`s and `0` `SYS_futex`
-//   syscalls when no sleeper is armed, and single-shot `exchange(0)` wake
-//   coalescing in `src/queue.cpp` when armed).
+// - Tier 2 (`state_ != nullptr`): hysteresis-disarmed `sleep_state` (`0`
+//   `seq_cst` fences in steady-state spin-caught traffic; inline `seq_cst`
+//   fence + `Shared` `needs_wake` read when sleepers are active).
 class AsymmetricParkLot {
   friend struct QueueTestPeer;
 
@@ -198,9 +226,12 @@ class AsymmetricParkLot {
       std::atomic<AsymmetricParkState*>& slot) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = slot.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (s->needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
-        wake_active_slow(s);
+      if ((s->sleep_state.load(kParkFastLoadOrder) & kParkFenceArmedBit) != 0U)
+          [[unlikely]] {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (s->needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+          wake_active_slow(s);
+        }
       }
     }
   }
@@ -214,13 +245,46 @@ class AsymmetricParkLot {
   }
 
   template <typename StopPred>
-  static THETA_ALIGNED_NOINLINE void wait_slot_until(
-      std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept;
+  static THETA_FORCE_INLINE void wait_slot_until(
+      std::atomic<AsymmetricParkState*>& slot, StopPred&& pred) noexcept {
+    if constexpr (kPassPredByVal<StopPred>) {
+      wait_slot_until_val(slot, std::forward<StopPred>(pred));
+    } else {
+      wait_slot_until_ref(slot, pred);
+    }
+  }
 
  private:
+  template <typename StopPred>
+  static THETA_ALIGNED_NOINLINE void wait_slot_until_val(
+      std::atomic<AsymmetricParkState*>& slot, StopPred pred) noexcept;
+
+  template <typename StopPred>
+  static THETA_ALIGNED_NOINLINE void wait_slot_until_ref(
+      std::atomic<AsymmetricParkState*>& slot, StopPred& pred) noexcept;
+
+  static THETA_FORCE_INLINE void on_spin_catch(
+      AsymmetricParkState* s) noexcept {
+    if (s->sleep_state.load(std::memory_order_relaxed) == kParkFenceBothBits &&
+        s->mode.load(std::memory_order_relaxed) == 2U) [[unlikely]] {
+      const std::uint32_t c =
+          s->spin_catches.load(std::memory_order_relaxed) + 1U;
+      if (c >= kParkDisarmSpinCatches) {
+        s->spin_catches.store(0U, std::memory_order_relaxed);
+        std::uint32_t expected = kParkFenceBothBits;
+        (void)s->sleep_state.compare_exchange_strong(
+            expected, 0U, std::memory_order_acq_rel, std::memory_order_relaxed);
+      } else {
+        s->spin_catches.store(c, std::memory_order_relaxed);
+      }
+    }
+  }
+
   [[gnu::cold]] static void wake_active_slow(AsymmetricParkState* s) noexcept;
   [[gnu::cold]] static AsymmetricParkState* get_or_activate_state_slow(
-      std::atomic<AsymmetricParkState*>& slot, std::uint8_t& out_mode) noexcept;
+      std::atomic<AsymmetricParkState*>& slot) noexcept;
+  [[gnu::cold]] static std::uint8_t arm_fence_slow(
+      AsymmetricParkState* s) noexcept;
   [[gnu::cold]] static void park_epoch(AsymmetricParkState* s, std::uint32_t ep,
                                        std::uint8_t mode) noexcept;
   [[gnu::cold]] static void destroy_state_slow(AsymmetricParkState* s) noexcept;
@@ -236,8 +300,10 @@ struct alignas(kHardwareDestructiveInterferenceSize) StripedParkState {
   static constexpr std::size_t kMaxStripes = 16;
 
   std::atomic<std::uint32_t> mode{1};
+  std::atomic<std::uint32_t> fence_state{kParkFenceBothBits};
   std::atomic<std::uint32_t> work_conserving{0};
   std::atomic<std::uint32_t> spin_shift{kMaxParkSpinShift};
+  std::atomic<std::uint32_t> spin_catches{0};
   std::atomic<std::uint32_t> ticket_waiters{0};
   std::atomic<std::uint32_t> unclaimed_spinner{0};
   std::atomic<std::uint32_t> unclaimed_waiters{0};
@@ -247,8 +313,26 @@ struct alignas(kHardwareDestructiveInterferenceSize) StripedParkState {
 };
 
 struct StripedParkLotBase {
+  static THETA_FORCE_INLINE void on_spin_catch(StripedParkState* s) noexcept {
+    if (s->fence_state.load(std::memory_order_relaxed) == kParkFenceBothBits &&
+        s->mode.load(std::memory_order_relaxed) == 2U &&
+        s->unclaimed_waiters.load(std::memory_order_relaxed) == 0U)
+        [[unlikely]] {
+      const std::uint32_t c =
+          s->spin_catches.load(std::memory_order_relaxed) + 1U;
+      if (c >= kParkDisarmSpinCatches) {
+        try_disarm_fence_slow(s);
+      } else {
+        s->spin_catches.store(c, std::memory_order_relaxed);
+      }
+    }
+  }
+
   [[gnu::cold]] static StripedParkState* get_or_activate_state_slow(
-      std::atomic<StripedParkState*>& slot, std::uint8_t& out_mode) noexcept;
+      std::atomic<StripedParkState*>& slot) noexcept;
+  [[gnu::cold]] static std::uint8_t arm_fence_slow(
+      StripedParkState* s) noexcept;
+  [[gnu::cold]] static void try_disarm_fence_slow(StripedParkState* s) noexcept;
   [[gnu::cold]] static void wake_stripe_slow(ParkStripe& stripe) noexcept;
   [[gnu::cold]] static void wake_unclaimed_one_slow(
       StripedParkState* s) noexcept;
@@ -268,8 +352,8 @@ struct StripedParkLotBase {
 
 // Compact 8-byte lazy ticket-striped + work-conserving 2-Tier eventcount:
 // eliminates thundering herds, cross-stripe false sharing, ongoing
-// `SYS_membarrier` IPIs, redundant `FUTEX_WAKE` storms, and empty-queue
-// multi-consumer ticket pre-claiming / spin churn.
+// `SYS_membarrier` IPIs, redundant `FUTEX_WAKE` storms, permanent `seq_cst`
+// fences after transient parks, and empty-queue ticket pre-claiming churn.
 template <std::size_t kStripes = 16>
 class StripedParkLot {
   static_assert((kStripes & (kStripes - 1U)) == 0U && kStripes >= 2U &&
@@ -323,14 +407,17 @@ class StripedParkLot {
   THETA_FORCE_INLINE void notify_ticket(std::uint64_t ticket) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
-        StripedParkLotBase::wake_unclaimed_one_slow(s);
-      }
-      ParkStripe& stripe =
-          s->stripes[static_cast<std::size_t>(ticket) & kStripeMask];
-      if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
-        StripedParkLotBase::wake_stripe_slow(stripe);
+      if ((s->fence_state.load(kParkFastLoadOrder) & kParkFenceArmedBit) != 0U)
+          [[unlikely]] {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+          StripedParkLotBase::wake_unclaimed_one_slow(s);
+        }
+        ParkStripe& stripe =
+            s->stripes[static_cast<std::size_t>(ticket) & kStripeMask];
+        if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+          StripedParkLotBase::wake_stripe_slow(stripe);
+        }
       }
     }
   }
@@ -341,19 +428,22 @@ class StripedParkLot {
       const HeadAtomic& head) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
-        // Elide `FUTEX_WAKE(1)` only when `unclaimed_spinner` is actively
-        // watching `head` (before `head` advances) AND `pos == head` (no older
-        // queued item proving spinner preemption or >= 2-item burst).
-        if (s->unclaimed_spinner.load(kParkFastLoadOrder) == 0U ||
-            pos != head.load(kParkFastLoadOrder)) {
-          StripedParkLotBase::wake_unclaimed_one_slow(s);
+      if ((s->fence_state.load(kParkFastLoadOrder) & kParkFenceArmedBit) != 0U)
+          [[unlikely]] {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (s->unclaimed_waiters.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+          // Elide `FUTEX_WAKE(1)` only when `unclaimed_spinner` is actively
+          // watching `head` (before `head` advances) AND `pos == head` (no
+          // older queued item proving spinner preemption or >= 2-item burst).
+          if (s->unclaimed_spinner.load(kParkFastLoadOrder) == 0U ||
+              pos != head.load(kParkFastLoadOrder)) {
+            StripedParkLotBase::wake_unclaimed_one_slow(s);
+          }
         }
-      }
-      ParkStripe& stripe = s->stripes[ring_slot & kStripeMask];
-      if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
-        StripedParkLotBase::wake_stripe_slow(stripe);
+        ParkStripe& stripe = s->stripes[ring_slot & kStripeMask];
+        if (stripe.needs_wake.load(kParkFastLoadOrder) != 0U) [[unlikely]] {
+          StripedParkLotBase::wake_stripe_slow(stripe);
+        }
       }
     }
   }
@@ -363,8 +453,11 @@ class StripedParkLot {
                                        std::size_t ring_mask) noexcept {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (auto* s = state_.load(kParkFastLoadOrder); s != nullptr) [[unlikely]] {
-      StripedParkLotBase::notify_range_active_slow(s, ring_mask, kStripeMask,
-                                                   base_ticket, count);
+      if ((s->fence_state.load(kParkFastLoadOrder) & kParkFenceArmedBit) != 0U)
+          [[unlikely]] {
+        StripedParkLotBase::notify_range_active_slow(s, ring_mask, kStripeMask,
+                                                     base_ticket, count);
+      }
     }
   }
 
@@ -375,10 +468,9 @@ class StripedParkLot {
                         : 0U;
   }
 
-  template <typename StopPred>
   THETA_ALIGNED_NOINLINE void wait_ticket(
-      std::uint64_t ticket, StopPred&& pred,
-      bool enable_work_conserving = false) noexcept;
+      std::uint64_t ticket, const std::atomic<std::uint64_t>& turn,
+      std::uint64_t expected, bool enable_work_conserving = false) noexcept;
 
   template <typename TryClaimFn, typename HasReadyFn>
   THETA_ALIGNED_NOINLINE void wait_unclaimed(TryClaimFn&& try_claim,
@@ -416,7 +508,8 @@ struct alignas(256) LaneMeta {
   std::uint64_t* data_cons{nullptr};
   std::uint64_t mask_cons{0};
   std::uint8_t cons_exclusive{1};
-  std::array<char, 128 - 33> pad_cons{};
+  std::uint8_t cons_steal_ready{0};
+  std::array<char, 128 - 34> pad_cons{};
 };
 static_assert(sizeof(LaneMeta) == 256);
 static_assert(offsetof(LaneMeta, tail) == 0);
@@ -429,6 +522,7 @@ static_assert(offsetof(LaneMeta, tail_cache) == 136);
 static_assert(offsetof(LaneMeta, data_cons) == 144);
 static_assert(offsetof(LaneMeta, mask_cons) == 152);
 static_assert(offsetof(LaneMeta, cons_exclusive) == 160);
+static_assert(offsetof(LaneMeta, cons_steal_ready) == 161);
 
 struct alignas(64) RichTurnLine {
   std::uint64_t turn{0};

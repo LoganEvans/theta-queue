@@ -26,9 +26,25 @@ struct QueueTestPeer {
   }
 
   template <typename T, std::size_t kCap>
+  [[nodiscard]] static bool spsc_cons_fence_armed(
+      const SPSCQueue<T, kCap>& q) noexcept {
+    const auto* s = q.cons_park_.load(std::memory_order_acquire);
+    return s != nullptr && (s->sleep_state.load(std::memory_order_acquire) &
+                            kParkFenceArmedBit) != 0U;
+  }
+
+  template <typename T, std::size_t kCap>
   [[nodiscard]] static std::uint8_t mpmc_cons_blocking_mode(
       const MPMCQueue<T, kCap, QueueOrder::StrictFIFO>& q) noexcept {
     return q.cons_park_.blocking_mode();
+  }
+
+  template <typename T, std::size_t kCap>
+  [[nodiscard]] static bool mpmc_cons_fence_armed(
+      const MPMCQueue<T, kCap, QueueOrder::StrictFIFO>& q) noexcept {
+    const auto* s = q.cons_park_.state_.load(std::memory_order_acquire);
+    return s != nullptr && (s->fence_state.load(std::memory_order_acquire) &
+                            kParkFenceArmedBit) != 0U;
   }
 
   template <typename T, std::size_t kCap>

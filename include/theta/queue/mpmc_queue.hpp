@@ -96,7 +96,8 @@ class MPMCQueue {
     const std::uint64_t expected = (pos >> sh) << 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
         [[unlikely]] {
-      wait_prod_turn(ring_slot, phys, expected);
+      prod_park_.wait_ticket(ring_slot, slots_.turn(phys), expected,
+                             /*enable_work_conserving=*/false);
     }
     slots_.storage(phys).construct(std::forward<Args>(args)...);
     slots_.turn(phys).store(expected + 1U, std::memory_order_release);
@@ -444,17 +445,6 @@ class MPMCQueue {
     }
   }
 
-  THETA_ALIGNED_NOINLINE void wait_prod_turn(std::size_t ring_slot,
-                                             std::size_t phys,
-                                             std::uint64_t expected) noexcept {
-    prod_park_.wait_ticket(
-        ring_slot,
-        [this, phys, expected]() noexcept {
-          return slots_.turn(phys).load(std::memory_order_acquire) == expected;
-        },
-        /*enable_work_conserving=*/false);
-  }
-
   THETA_ALIGNED_NOINLINE void wait_cons_turn(std::uint64_t pos,
                                              std::size_t ring_slot,
                                              std::size_t phys,
@@ -464,12 +454,8 @@ class MPMCQueue {
     // mid-push during a deep flood (`tail_ > pos + 1`, e.g.
     // `BM_MPMC_Blocking`).
     const bool queue_empty = (pos >= tail_.load(std::memory_order_relaxed));
-    cons_park_.wait_ticket(
-        ring_slot,
-        [this, phys, expected]() noexcept {
-          return slots_.turn(phys).load(std::memory_order_acquire) == expected;
-        },
-        /*enable_work_conserving=*/queue_empty);
+    cons_park_.wait_ticket(ring_slot, slots_.turn(phys), expected,
+                           /*enable_work_conserving=*/queue_empty);
   }
 
   THETA_FORCE_INLINE void maybe_promote_to_flood_mode(std::uint64_t pos,

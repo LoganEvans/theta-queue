@@ -235,9 +235,8 @@ class MPSCQueue {
     const std::uint64_t expected = (pos >> sh) << 1U;
     if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
         [[unlikely]] {
-      prod_park_.wait_ticket(ring_slot, [this, phys, expected]() noexcept {
-        return slots_.turn(phys).load(std::memory_order_acquire) == expected;
-      });
+      prod_park_.wait_ticket(ring_slot, slots_.turn(phys), expected,
+                             /*enable_work_conserving=*/false);
     }
     slots_.storage(phys).construct(std::forward<Args>(args)...);
     slots_.turn(phys).store(expected + 1U, std::memory_order_release);
@@ -340,10 +339,10 @@ class MPSCQueue {
     const std::size_t ring_slot = static_cast<std::size_t>(pos) & m;
     const std::size_t phys = queue::detail::remap_slot_index(ring_slot, sh);
     const std::uint64_t expected = ((pos >> sh) << 1U) + 1U;
-    if (slots_.turn(phys).load(std::memory_order_acquire) != expected)
-        [[unlikely]] {
-      cons_park_.wait_until([this, phys, expected]() noexcept {
-        return slots_.turn(phys).load(std::memory_order_acquire) == expected;
+    const std::atomic<std::uint64_t>* const turn_ptr = &slots_.turn(phys);
+    if (turn_ptr->load(std::memory_order_acquire) != expected) [[unlikely]] {
+      cons_park_.wait_until([turn_ptr, expected]() noexcept {
+        return turn_ptr->load(std::memory_order_acquire) == expected;
       });
     }
     head_.store(pos + 1U, std::memory_order_release);

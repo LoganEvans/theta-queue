@@ -19,6 +19,8 @@ struct ArchBackend {
 
   static THETA_FORCE_INLINE void stlf_micro_pause() noexcept { cpu_relax(); }
 
+  static THETA_FORCE_INLINE void polite_relax() noexcept { cpu_relax(); }
+
   static THETA_FORCE_INLINE void prefetch_for_write(const void* addr) noexcept {
     __builtin_prefetch(addr, 1, 3);
   }

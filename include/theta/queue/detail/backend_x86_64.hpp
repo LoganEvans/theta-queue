@@ -35,6 +35,8 @@ struct ArchBackend {
     ::theta::arch::cpu_relax();
   }
 
+  static THETA_FORCE_INLINE void polite_relax() noexcept { cpu_relax(); }
+
   static THETA_FORCE_INLINE void stlf_micro_pause() noexcept {
     if constexpr (::theta::arch::kHasRedZoneStlfPause) {
       std::uint64_t dep = 0;
